@@ -1,0 +1,42 @@
+# configs/gpt2_full.yaml
+# Milestone B: Full GPT-2 experiment with all baselines and ablation study 1
+
+experiment_name: gpt2_full_milestone_b
+model_name: gpt2-medium        # 345M; swap to gpt2 (124M) if memory constrained
+output_dir: results/gpt2_full
+device: cuda
+
+# Calibration (full as per proposal)
+n_calibration_samples: 512
+calibration_seq_len: 512
+calibration_batch_size: 4
+
+# Our method
+target_avg_bits: 1.61
+granularity: weight
+quant_scheme: symmetric
+refine_scales: true
+salience_metrics:
+  - magnitude_l1
+  - magnitude_l2
+  - gradient
+  - hessian
+  - activation
+
+# Evaluation
+eval_datasets:
+  - wikitext2
+  - ptb
+run_mmlu: false               # GPT-2 too small for meaningful MMLU
+run_latency: true
+
+# What to run
+run:
+  - baselines
+  - ours
+  - ablations
+
+# Ablation study 1 (Milestone B)
+ablation_types:
+  - salience_metric           # Compare each of 5 metrics individually
+  - granularity               # layer vs channel vs weight allocation
