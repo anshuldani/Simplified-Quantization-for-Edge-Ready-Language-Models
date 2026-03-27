@@ -5,7 +5,7 @@
 experiment_name: gpt2_quick_milestone_a
 model_name: gpt2
 output_dir: results/gpt2_quick
-device: cuda
+device: auto
 
 # Calibration
 n_calibration_samples: 128   # reduced for quick test
@@ -29,6 +29,7 @@ eval_datasets:
   - wikitext2
 run_mmlu: false               # skip MMLU for quick test
 run_latency: false            # skip latency for quick test
+max_eval_tokens: 4096         # cap tokens for fast CPU eval (~7 steps vs 562)
 
 # What to run
 run:
