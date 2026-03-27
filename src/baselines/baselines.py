@@ -29,10 +29,13 @@ class FP16Baseline:
     """
 
     @staticmethod
-    def apply(model: nn.Module) -> nn.Module:
+    def apply(model: nn.Module, device: str = "cuda") -> nn.Module:
         model = copy.deepcopy(model)
-        model = model.half()
-        logger.info("FP16 baseline: model cast to float16")
+        if device == "cuda":
+            model = model.half()
+            logger.info("FP16 baseline: model cast to float16")
+        else:
+            logger.info("FP16 baseline: keeping float32 (float16 not accelerated on %s)", device)
         return model
 
     @staticmethod
