@@ -51,11 +51,26 @@ class SalienceComputer:
         self._layer_to_param: Dict[str, str] = {}
 
     def _build_layer_param_map(self):
-        """Build mapping from layer name to weight param name for activation lookup."""
+        """Build mapping from layer name to weight param name for activation lookup.
+
+        Covers nn.Linear and Conv1D (GPT-2) — any module with a 2-D weight parameter,
+        excluding embeddings.
+        """
+        param_set = {n for n, _ in self.model.named_parameters()}
         for name, module in self.model.named_modules():
-            if isinstance(module, nn.Linear):
+            has_2d_weight = (
+                isinstance(module, nn.Linear)
+                or (
+                    hasattr(module, "weight")
+                    and isinstance(module.weight, nn.Parameter)
+                    and module.weight.dim() == 2
+                    and not isinstance(module, nn.Embedding)
+                )
+            )
+            if has_2d_weight:
                 param_name = f"{name}.weight"
-                self._layer_to_param[name] = param_name
+                if param_name in param_set:
+                    self._layer_to_param[name] = param_name
 
     def compute(
         self,
