@@ -169,9 +169,22 @@ class ActivationSalience:
         self._hooks = []
 
     def register_hooks(self, model: nn.Module):
-        """Register forward hooks on linear layers to track input activations."""
+        """Register forward hooks on linear-like layers to track input activations.
+
+        Covers both nn.Linear and HuggingFace Conv1D (used in GPT-2), which both
+        have a 2-D weight parameter but are different module types.
+        """
         for name, module in model.named_modules():
-            if isinstance(module, nn.Linear):
+            has_2d_weight = (
+                isinstance(module, nn.Linear)
+                or (
+                    hasattr(module, "weight")
+                    and isinstance(module.weight, nn.Parameter)
+                    and module.weight.dim() == 2
+                    and not isinstance(module, nn.Embedding)
+                )
+            )
+            if has_2d_weight:
                 hook = module.register_forward_hook(
                     lambda m, inp, out, n=name: self._capture_activation(n, inp[0])
                 )
@@ -211,8 +224,11 @@ class ActivationSalience:
         act_scale = self._activation_stats[layer_name]  # [in_features]
 
         if weight.dim() == 2 and weight.shape[1] == act_scale.shape[0]:
-            # [out, in] * [in] -> broadcast over out dimension
+            # nn.Linear layout: weight is [out, in]
             salience = weight.abs() * act_scale.unsqueeze(0)
+        elif weight.dim() == 2 and weight.shape[0] == act_scale.shape[0]:
+            # HuggingFace Conv1D layout: weight is [in, out] (transposed)
+            salience = weight.abs() * act_scale.unsqueeze(1)
         else:
             # Shape mismatch fallback
             logger.warning(f"Activation shape mismatch for {layer_name}: "
