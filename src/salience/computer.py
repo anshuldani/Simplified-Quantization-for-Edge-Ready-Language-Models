@@ -200,6 +200,15 @@ class SalienceComputer:
         self.config.metrics = original_metrics
         return result
 
+    @staticmethod
+    def _quantiles(t: torch.Tensor, qs) -> list:
+        """Compute quantiles safely — torch.quantile fails on CUDA for >2^24 elements."""
+        MAX = 2 ** 24
+        if t.numel() > MAX:
+            idx = torch.randperm(t.numel(), device=t.device)[:MAX]
+            t = t[idx]
+        return [t.quantile(q).item() for q in qs]
+
     def get_salience_stats(self, salience_map: Dict[str, torch.Tensor]) -> Dict:
         """Compute summary statistics for logging/visualization."""
         stats = {}
@@ -208,24 +217,26 @@ class SalienceComputer:
         for name, scores in salience_map.items():
             flat = scores.flatten().float()
             all_scores.append(flat)
+            p25, p50, p75, p95 = self._quantiles(flat, [0.25, 0.50, 0.75, 0.95])
             stats[name] = {
                 "mean": flat.mean().item(),
                 "std": flat.std().item(),
                 "min": flat.min().item(),
                 "max": flat.max().item(),
-                "p25": flat.quantile(0.25).item(),
-                "p50": flat.quantile(0.50).item(),
-                "p75": flat.quantile(0.75).item(),
-                "p95": flat.quantile(0.95).item(),
+                "p25": p25,
+                "p50": p50,
+                "p75": p75,
+                "p95": p95,
                 "numel": flat.numel(),
             }
 
         if all_scores:
             global_flat = torch.cat(all_scores)
+            p80, = self._quantiles(global_flat, [0.80])
             stats["_global"] = {
                 "mean": global_flat.mean().item(),
                 "std": global_flat.std().item(),
-                "p80": global_flat.quantile(0.80).item(),  # 80/20 threshold
+                "p80": p80,  # 80/20 threshold
                 "total_params": global_flat.numel(),
             }
 
