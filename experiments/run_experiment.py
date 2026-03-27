@@ -1,0 +1,384 @@
+"""
+experiments/run_experiment.py
+
+Main experiment runner. Supports:
+  - Single model quantization + eval
+  - Baseline comparisons
+  - Ablation sweeps
+  - Results aggregation
+
+Usage:
+    python experiments/run_experiment.py --config configs/gpt2_quick.yaml
+    python experiments/run_experiment.py --config configs/gpt2_full.yaml
+    python experiments/run_experiment.py --config configs/llama_full.yaml
+"""
+
+import os
+import sys
+import json
+import yaml
+import copy
+import logging
+import argparse
+import time
+from dataclasses import dataclass, field, asdict
+from typing import Dict, List, Optional
+
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# Add project root to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from src.salience.metrics import SalienceConfig
+from src.quantizer.allocator import AllocationConfig
+from src.quantizer.salient_mask import QuantizerConfig, SalientMaskQuantizer
+from src.baselines.baselines import UniformINT2Baseline, BitNetTernaryBaseline, FP16Baseline
+from src.eval.evaluator import ModelEvaluator
+from src.utils.data import get_c4_calibration_dataloader
+from src.utils.logging_utils import setup_logging, ResultsTracker
+from src.utils.viz import (
+    plot_salience_distributions,
+    plot_bit_allocation_heatmap,
+    plot_ablation_comparison,
+    plot_baseline_comparison,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def load_model_and_tokenizer(model_name: str, device: str = "cuda"):
+    """Load model and tokenizer from HuggingFace."""
+    logger.info(f"Loading model: {model_name}")
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.float16,
+        device_map="auto" if device == "cuda" else None,
+        trust_remote_code=True,
+    )
+
+    if device != "cuda":
+        model = model.to(device)
+
+    model.eval()
+
+    n_params = sum(p.numel() for p in model.parameters())
+    logger.info(f"Model loaded: {n_params/1e6:.1f}M parameters")
+
+    return model, tokenizer
+
+
+def run_baseline_experiments(
+    model_name: str,
+    tokenizer,
+    calibration_dataloader,
+    eval_datasets: List[str],
+    device: str,
+    run_mmlu: bool,
+    run_latency: bool,
+    output_dir: str,
+    tracker: ResultsTracker,
+):
+    """Run all baseline experiments."""
+    baselines = {
+        "fp16": FP16Baseline(),
+        "uniform_int2": UniformINT2Baseline(),
+        "bitnet": BitNetTernaryBaseline(),
+    }
+
+    for baseline_name, baseline in baselines.items():
+        logger.info(f"\nRunning baseline: {baseline_name}")
+
+        # Load fresh model for each baseline
+        base_model, _ = load_model_and_tokenizer(model_name, device)
+
+        # Apply quantization
+        quantized = baseline.apply(base_model)
+
+        # Evaluate
+        evaluator = ModelEvaluator(quantized, tokenizer, device)
+        results = evaluator.evaluate_all(
+            run_mmlu=run_mmlu,
+            run_latency=run_latency,
+            run_perplexity=True,
+            datasets=eval_datasets,
+        )
+        results["avg_bits"] = baseline.avg_bits()
+
+        tracker.add_result(baseline_name, results)
+        del quantized, base_model
+        torch.cuda.empty_cache()
+
+
+def run_ours(
+    model_name: str,
+    tokenizer,
+    calibration_dataloader,
+    eval_datasets: List[str],
+    device: str,
+    run_mmlu: bool,
+    run_latency: bool,
+    output_dir: str,
+    tracker: ResultsTracker,
+    config: QuantizerConfig,
+):
+    """Run our SalientMaskQuantizer."""
+    logger.info("\nRunning our method: SalientMaskQuantizer")
+
+    base_model, _ = load_model_and_tokenizer(model_name, device)
+
+    quantizer = SalientMaskQuantizer(base_model, config, device=device)
+    quantizer.quantize(calibration_dataloader)
+
+    # Save intermediate results
+    results_subdir = os.path.join(output_dir, "ours")
+    quantizer.save_results(results_subdir)
+
+    # Visualize salience
+    if quantizer.salience_map:
+        stats = quantizer.salience_computer.get_salience_stats(quantizer.salience_map)
+        plot_salience_distributions(
+            stats,
+            os.path.join(output_dir, "plots", "salience_distributions.png"),
+        )
+
+    # Visualize bit allocation
+    if quantizer.bit_map:
+        alloc_stats = quantizer.bit_allocator.get_allocation_stats(quantizer.bit_map)
+        plot_bit_allocation_heatmap(
+            alloc_stats,
+            os.path.join(output_dir, "plots", "bit_allocation.png"),
+        )
+
+    # Evaluate
+    evaluator = ModelEvaluator(base_model, tokenizer, device)
+    eval_results = evaluator.evaluate_all(
+        run_mmlu=run_mmlu,
+        run_latency=run_latency,
+        run_perplexity=True,
+        datasets=eval_datasets,
+    )
+    eval_results["avg_bits"] = quantizer.get_memory_footprint().get("avg_bits", 0)
+    eval_results["memory_footprint"] = quantizer.get_memory_footprint()
+    eval_results["timing"] = quantizer.timing
+
+    tracker.add_result("ours", eval_results)
+
+    del base_model
+    torch.cuda.empty_cache()
+    return eval_results
+
+
+def run_ablation_study(
+    model_name: str,
+    tokenizer,
+    calibration_dataloader,
+    eval_datasets: List[str],
+    device: str,
+    output_dir: str,
+    ablation_type: str = "salience_metric",
+):
+    """
+    Run ablation studies.
+
+    ablation_type options:
+      - "salience_metric": Compare each of the 5 metrics individually
+      - "bit_budget": Compare different target avg bits
+      - "calibration_size": Compare 128 vs 512 vs 1024 samples
+      - "granularity": Compare weight vs channel vs layer allocation
+      - "quant_scheme": Compare symmetric vs asymmetric 2-bit
+      - "ensemble_weights": Compare different alpha configurations
+    """
+    logger.info(f"\nRunning ablation: {ablation_type}")
+
+    ablation_results = {}
+    ablation_configs = _get_ablation_configs(ablation_type)
+
+    for config_name, config in ablation_configs.items():
+        logger.info(f"  Ablation config: {config_name}")
+
+        base_model, _ = load_model_and_tokenizer(model_name, device)
+        quantizer = SalientMaskQuantizer(base_model, config, device=device)
+        quantizer.quantize(calibration_dataloader)
+
+        evaluator = ModelEvaluator(base_model, tokenizer, device)
+        results = evaluator.evaluate_all(
+            run_mmlu=False,
+            run_latency=False,
+            run_perplexity=True,
+            datasets=eval_datasets[:1],  # Only WikiText-2 for ablations
+        )
+        results["avg_bits"] = quantizer.get_memory_footprint().get("avg_bits", 0)
+
+        ppl = results.get("ppl_wikitext2", {}).get("perplexity", float("nan"))
+        ablation_results[config_name] = {
+            "perplexity": ppl,
+            "avg_bits": results["avg_bits"],
+        }
+        logger.info(f"    PPL: {ppl:.2f}, avg bits: {results['avg_bits']:.3f}")
+
+        del base_model
+        torch.cuda.empty_cache()
+
+    # Save and plot
+    ablation_path = os.path.join(output_dir, f"ablation_{ablation_type}.json")
+    with open(ablation_path, "w") as f:
+        json.dump(ablation_results, f, indent=2)
+
+    plot_ablation_comparison(
+        ablation_results,
+        output_path=os.path.join(output_dir, "plots", f"ablation_{ablation_type}.png"),
+        title=f"Ablation: {ablation_type.replace('_', ' ').title()}",
+    )
+
+    return ablation_results
+
+
+def _get_ablation_configs(ablation_type: str) -> Dict[str, QuantizerConfig]:
+    """Generate configs for each ablation type."""
+    configs = {}
+
+    if ablation_type == "salience_metric":
+        for metric in ["magnitude_l1", "magnitude_l2", "gradient", "hessian", "activation"]:
+            sal_config = SalienceConfig(metrics=[metric])
+            configs[metric] = QuantizerConfig(
+                salience=sal_config,
+                allocation=AllocationConfig(target_avg_bits=1.61),
+            )
+        # Also test ensemble
+        configs["combined"] = QuantizerConfig(
+            salience=SalienceConfig(metrics=["magnitude_l1", "magnitude_l2", "gradient", "hessian", "activation"]),
+            allocation=AllocationConfig(target_avg_bits=1.61),
+        )
+
+    elif ablation_type == "bit_budget":
+        for target_bits in [1.0, 1.3, 1.61, 2.0, 2.5]:
+            configs[f"target_{target_bits}b"] = QuantizerConfig(
+                allocation=AllocationConfig(target_avg_bits=target_bits)
+            )
+
+    elif ablation_type == "calibration_size":
+        for n_samples in [128, 256, 512, 1024]:
+            sal_config = SalienceConfig(n_calibration_samples=n_samples)
+            configs[f"n{n_samples}"] = QuantizerConfig(salience=sal_config)
+
+    elif ablation_type == "granularity":
+        for granularity in ["weight", "channel", "layer"]:
+            configs[granularity] = QuantizerConfig(
+                allocation=AllocationConfig(
+                    target_avg_bits=1.61,
+                    granularity=granularity,
+                )
+            )
+
+    elif ablation_type == "quant_scheme":
+        for scheme in ["symmetric", "asymmetric"]:
+            configs[scheme] = QuantizerConfig(
+                scheme_2bit=scheme,
+                allocation=AllocationConfig(target_avg_bits=1.61),
+            )
+
+    return configs
+
+
+def main():
+    parser = argparse.ArgumentParser(description="SalientMask Quantization Experiments")
+    parser.add_argument("--config", type=str, required=True, help="YAML config file")
+    parser.add_argument("--device", type=str, default=None, help="Override device (cpu/cuda)")
+    args = parser.parse_args()
+
+    # Load config
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
+
+    device = args.device or cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu")
+    model_name = cfg["model_name"]
+    output_dir = cfg.get("output_dir", f"results/{model_name.replace('/', '_')}")
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(os.path.join(output_dir, "plots"), exist_ok=True)
+
+    # Setup logging
+    setup_logging(
+        log_dir=os.path.join(output_dir, "logs"),
+        experiment_name=cfg.get("experiment_name", "experiment"),
+    )
+
+    logger.info(f"Config: {json.dumps(cfg, indent=2)}")
+    logger.info(f"Device: {device}")
+
+    # Load tokenizer and calibration data
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    calibration_dataloader = get_c4_calibration_dataloader(
+        tokenizer,
+        n_samples=cfg.get("n_calibration_samples", 512),
+        seq_len=cfg.get("calibration_seq_len", 512),
+        batch_size=cfg.get("calibration_batch_size", 4),
+    )
+
+    eval_datasets = cfg.get("eval_datasets", ["wikitext2", "ptb"])
+    run_mmlu = cfg.get("run_mmlu", False)
+    run_latency = cfg.get("run_latency", True)
+
+    tracker = ResultsTracker(output_dir, cfg.get("experiment_name", "experiment"))
+
+    # Build our method config
+    our_config = QuantizerConfig(
+        salience=SalienceConfig(
+            metrics=cfg.get("salience_metrics", ["magnitude_l1", "magnitude_l2", "gradient", "hessian", "activation"]),
+            n_calibration_samples=cfg.get("n_calibration_samples", 512),
+        ),
+        allocation=AllocationConfig(
+            target_avg_bits=cfg.get("target_avg_bits", 1.61),
+            granularity=cfg.get("granularity", "weight"),
+        ),
+        scheme_2bit=cfg.get("quant_scheme", "symmetric"),
+        refine_scales=cfg.get("refine_scales", True),
+    )
+
+    # Run experiments based on config
+    run_types = cfg.get("run", ["ours", "baselines"])
+
+    if "baselines" in run_types:
+        run_baseline_experiments(
+            model_name, tokenizer, calibration_dataloader,
+            eval_datasets, device, run_mmlu, run_latency, output_dir, tracker,
+        )
+
+    if "ours" in run_types:
+        run_ours(
+            model_name, tokenizer, calibration_dataloader,
+            eval_datasets, device, run_mmlu, run_latency, output_dir, tracker,
+            our_config,
+        )
+
+    if "ablations" in run_types:
+        for ablation_type in cfg.get("ablation_types", ["salience_metric"]):
+            run_ablation_study(
+                model_name, tokenizer, calibration_dataloader,
+                eval_datasets, device, output_dir, ablation_type,
+            )
+
+    # Final summary
+    tracker.print_summary()
+
+    # Final comparison plot
+    if len(tracker.results["models"]) > 1:
+        plot_baseline_comparison(
+            tracker.results["models"],
+            output_path=os.path.join(output_dir, "plots", "baseline_comparison.png"),
+            model_name=model_name,
+        )
+
+    logger.info(f"\nAll results saved to: {output_dir}")
+
+
+if __name__ == "__main__":
+    main()
