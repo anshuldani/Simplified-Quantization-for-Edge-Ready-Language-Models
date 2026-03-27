@@ -1,0 +1,36 @@
+# configs/gpt2_quick.yaml
+# Milestone A: Quick verification on GPT-2 small (124M)
+# Fast run to verify the full pipeline works end-to-end
+
+experiment_name: gpt2_quick_milestone_a
+model_name: gpt2
+output_dir: results/gpt2_quick
+device: cuda
+
+# Calibration
+n_calibration_samples: 128   # reduced for quick test
+calibration_seq_len: 256
+calibration_batch_size: 4
+
+# Our method
+target_avg_bits: 1.61
+granularity: weight           # weight | channel | layer
+quant_scheme: symmetric       # symmetric | asymmetric
+refine_scales: true
+salience_metrics:
+  - magnitude_l1
+  - magnitude_l2
+  - gradient
+  - hessian
+  - activation
+
+# Evaluation
+eval_datasets:
+  - wikitext2
+run_mmlu: false               # skip MMLU for quick test
+run_latency: false            # skip latency for quick test
+
+# What to run
+run:
+  - baselines
+  - ours
