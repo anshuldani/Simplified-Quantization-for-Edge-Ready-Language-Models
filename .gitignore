@@ -22,6 +22,7 @@ ENV/
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb
+!notebooks/*.ipynb
 
 # ML / model artifacts
 *.pt
