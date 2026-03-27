@@ -1,0 +1,46 @@
+# configs/llama_full.yaml
+# Milestone C: Full LLaMA-3.2-1B experiment with all ablations and MMLU
+
+experiment_name: llama_full_milestone_c
+model_name: meta-llama/Llama-3.2-1B
+output_dir: results/llama_full
+device: cuda
+
+# Calibration (full as per proposal)
+n_calibration_samples: 512
+calibration_seq_len: 512
+calibration_batch_size: 2     # smaller batch for larger model
+
+# Our method
+target_avg_bits: 1.61
+granularity: weight
+quant_scheme: symmetric
+refine_scales: true
+salience_metrics:
+  - magnitude_l1
+  - magnitude_l2
+  - gradient
+  - hessian
+  - activation
+
+# Evaluation
+eval_datasets:
+  - wikitext2
+  - ptb
+run_mmlu: true                # Full MMLU 5-shot for LLaMA
+run_latency: true
+
+# What to run
+run:
+  - baselines
+  - ours
+  - ablations
+
+# All 6 ablation studies (Milestone C)
+ablation_types:
+  - salience_metric
+  - bit_budget
+  - calibration_size
+  - granularity
+  - quant_scheme
+  - ensemble_weights
