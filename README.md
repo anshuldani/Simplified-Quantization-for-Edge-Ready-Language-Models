@@ -1,7 +1,10 @@
 # Salient-Quant: Mixed-Precision Quantization for Edge-Ready LLMs
 
 **CS595-2 Course Project — Illinois Institute of Technology**
-Anshul Dani (A20580060) · Rohit Lahori (A20582911)
+
+Anshul Dani (A20580060) 
+
+Rohit Lahori (A20582911)
 
 ---
 
