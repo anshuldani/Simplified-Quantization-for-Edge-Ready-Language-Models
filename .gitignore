@@ -1,0 +1,71 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.conda/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# ML / model artifacts
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.gguf
+*.ckpt
+checkpoints/
+model_cache/
+hf_cache/
+~/.cache/huggingface/
+
+# Results and outputs
+results/*.csv
+results/*.json
+results/*.png
+results/*.pdf
+results/plots/
+results/checkpoints/
+wandb/
+
+# Experiment logs
+*.log
+logs/
+
+# SLURM
+*.out
+*.err
+slurm-*.out
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment / secrets
+.env
+*.env
