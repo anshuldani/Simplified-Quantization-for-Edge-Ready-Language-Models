@@ -1,0 +1,36 @@
+# configs/gpt2_colab.yaml
+# Google Colab run — GPT-2 small (124M) on GPU
+# Full calibration + full perplexity eval (no token cap)
+
+experiment_name: gpt2_colab
+model_name: gpt2
+output_dir: results/gpt2_colab
+device: auto                  # auto-selects cuda on Colab
+
+# Calibration
+n_calibration_samples: 512
+calibration_seq_len: 512
+calibration_batch_size: 8
+
+# Our method
+target_avg_bits: 1.61
+granularity: weight
+quant_scheme: symmetric
+refine_scales: true
+salience_metrics:
+  - magnitude_l1
+  - magnitude_l2
+  - gradient
+  - hessian
+  - activation
+
+# Evaluation — full run, no token cap needed on GPU
+eval_datasets:
+  - wikitext2
+run_mmlu: false
+run_latency: false
+
+# What to run
+run:
+  - baselines
+  - ours
