@@ -156,13 +156,35 @@ class SalientMaskQuantizer:
         return self.model
 
     def _get_quantizable_params(self) -> list:
-        """Get all weight matrix param names for target layer types."""
+        """Get all weight matrix param names for target layer types.
+
+        Falls back to matching any module with a 2-D weight tensor when
+        target_layer_types don't match (e.g. HuggingFace Conv1D in GPT-2).
+        """
+        # First try the configured layer types
         params = []
         for name, module in self.model.named_modules():
             if isinstance(module, self.config.target_layer_types):
                 param_name = f"{name}.weight"
                 if any(n == param_name for n, _ in self.model.named_parameters()):
                     params.append(param_name)
+
+        # Fallback: if nothing matched, collect any module with a 2-D weight
+        # (covers nn.Linear and transformers Conv1D alike)
+        if not params:
+            logger.warning(
+                "No layers matched target_layer_types=%s; "
+                "falling back to any module with a 2-D weight parameter.",
+                self.config.target_layer_types,
+            )
+            param_set = {n for n, _ in self.model.named_parameters()}
+            for name, module in self.model.named_modules():
+                param_name = f"{name}.weight"
+                if param_name in param_set:
+                    w = dict(module.named_parameters(recurse=False)).get("weight")
+                    if w is not None and w.dim() == 2:
+                        params.append(param_name)
+
         return params
 
     def _apply_quantization(self, target_params: list):
