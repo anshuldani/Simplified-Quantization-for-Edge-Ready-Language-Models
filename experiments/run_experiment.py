@@ -83,6 +83,7 @@ def run_baseline_experiments(
     run_latency: bool,
     output_dir: str,
     tracker: ResultsTracker,
+    max_eval_tokens: Optional[int] = None,
 ):
     """Run all baseline experiments."""
     baselines = {
@@ -98,7 +99,7 @@ def run_baseline_experiments(
         base_model, _ = load_model_and_tokenizer(model_name, device)
 
         # Apply quantization
-        quantized = baseline.apply(base_model)
+        quantized = baseline.apply(base_model, device) if baseline_name == "fp16" else baseline.apply(base_model)
 
         # Evaluate
         evaluator = ModelEvaluator(quantized, tokenizer, device)
@@ -107,6 +108,7 @@ def run_baseline_experiments(
             run_latency=run_latency,
             run_perplexity=True,
             datasets=eval_datasets,
+            max_eval_tokens=max_eval_tokens,
         )
         results["avg_bits"] = baseline.avg_bits()
 
@@ -126,6 +128,7 @@ def run_ours(
     output_dir: str,
     tracker: ResultsTracker,
     config: QuantizerConfig,
+    max_eval_tokens: Optional[int] = None,
 ):
     """Run our SalientMaskQuantizer."""
     logger.info("\nRunning our method: SalientMaskQuantizer")
@@ -162,6 +165,7 @@ def run_ours(
         run_latency=run_latency,
         run_perplexity=True,
         datasets=eval_datasets,
+        max_eval_tokens=max_eval_tokens,
     )
     eval_results["avg_bits"] = quantizer.get_memory_footprint().get("avg_bits", 0)
     eval_results["memory_footprint"] = quantizer.get_memory_footprint()
@@ -296,7 +300,16 @@ def main():
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
-    device = args.device or cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu")
+    raw_device = args.device or cfg.get("device", "auto")
+    if raw_device == "auto":
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
+    else:
+        device = raw_device
     model_name = cfg["model_name"]
     output_dir = cfg.get("output_dir", f"results/{model_name.replace('/', '_')}")
     os.makedirs(output_dir, exist_ok=True)
@@ -346,17 +359,20 @@ def main():
     # Run experiments based on config
     run_types = cfg.get("run", ["ours", "baselines"])
 
+    max_eval_tokens = cfg.get("max_eval_tokens", None)
+
     if "baselines" in run_types:
         run_baseline_experiments(
             model_name, tokenizer, calibration_dataloader,
             eval_datasets, device, run_mmlu, run_latency, output_dir, tracker,
+            max_eval_tokens=max_eval_tokens,
         )
 
     if "ours" in run_types:
         run_ours(
             model_name, tokenizer, calibration_dataloader,
             eval_datasets, device, run_mmlu, run_latency, output_dir, tracker,
-            our_config,
+            our_config, max_eval_tokens=max_eval_tokens,
         )
 
     if "ablations" in run_types:
