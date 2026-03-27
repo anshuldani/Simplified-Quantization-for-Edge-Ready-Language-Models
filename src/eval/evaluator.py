@@ -46,12 +46,14 @@ class PerplexityEvaluator:
         device: str = "cuda",
         stride: int = 512,
         max_length: int = 1024,
+        max_eval_tokens: Optional[int] = None,
     ):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
         self.stride = stride
         self.max_length = max_length
+        self.max_eval_tokens = max_eval_tokens
 
     def evaluate(self, dataset_name: str = "wikitext2") -> Dict:
         """
@@ -82,6 +84,8 @@ class PerplexityEvaluator:
         nlls = []
         n_tokens = 0
         seq_len = input_ids.size(1)
+        if self.max_eval_tokens is not None:
+            seq_len = min(seq_len, self.max_eval_tokens)
 
         self.model.eval()
         self.model.to(self.device)
@@ -96,7 +100,12 @@ class PerplexityEvaluator:
                 trg_len = end_loc - prev_end  # tokens to score this step
                 input_ids_chunk = input_ids[:, begin_loc:end_loc].to(self.device)
 
-                with torch.cuda.amp.autocast(enabled=True):
+                autocast_ctx = (
+                    torch.amp.autocast("cuda")
+                    if self.device == "cuda"
+                    else torch.amp.autocast("cpu", enabled=False)
+                )
+                with autocast_ctx:
                     outputs = self.model(input_ids_chunk, labels=input_ids_chunk)
                     neg_log_likelihood = outputs.loss * trg_len
 
@@ -380,6 +389,7 @@ class ModelEvaluator:
         run_latency: bool = True,
         run_perplexity: bool = True,
         datasets: List[str] = None,
+        max_eval_tokens: Optional[int] = None,
     ) -> Dict:
         """Run full evaluation suite."""
         if datasets is None:
@@ -388,7 +398,8 @@ class ModelEvaluator:
         results = {}
 
         if run_perplexity:
-            ppl_eval = PerplexityEvaluator(self.model, self.tokenizer, self.device)
+            ppl_eval = PerplexityEvaluator(self.model, self.tokenizer, self.device,
+                                           max_eval_tokens=max_eval_tokens)
             for ds in datasets:
                 try:
                     ppl_result = ppl_eval.evaluate(ds)
