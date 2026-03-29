@@ -19,6 +19,23 @@ import copy
 logger = logging.getLogger(__name__)
 
 
+def _is_quantizable_linear(module: nn.Module) -> bool:
+    """Return True for nn.Linear and Conv1D-style modules (e.g. GPT-2).
+
+    Matches any module with a 2-D weight parameter that is not an embedding.
+    """
+    if isinstance(module, (nn.Embedding, nn.EmbeddingBag)):
+        return False
+    return (
+        isinstance(module, nn.Linear)
+        or (
+            hasattr(module, "weight")
+            and isinstance(module.weight, nn.Parameter)
+            and module.weight.dim() == 2
+        )
+    )
+
+
 # -----------------------------------------------------------------------
 # FP16 Baseline
 # -----------------------------------------------------------------------
@@ -65,7 +82,7 @@ class UniformINT2Baseline:
 
         n_quantized = 0
         for name, module in tqdm(model.named_modules(), desc="Uniform INT2"):
-            if isinstance(module, nn.Linear):
+            if _is_quantizable_linear(module):
                 weight = module.weight.data.float()
                 deq_weight = self._quantize_2bit(weight)
                 module.weight.data = deq_weight.to(module.weight.data.dtype)
@@ -118,7 +135,7 @@ class BitNetTernaryBaseline:
         n_quantized = 0
 
         for name, module in tqdm(model.named_modules(), desc="BitNet Ternary"):
-            if isinstance(module, nn.Linear):
+            if _is_quantizable_linear(module):
                 weight = module.weight.data.float()
                 deq = BitNetTernaryBaseline._quantize_ternary(weight)
                 module.weight.data = deq.to(module.weight.data.dtype)
