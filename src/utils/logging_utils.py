@@ -50,6 +50,11 @@ def setup_logging(
     logger.addHandler(console_handler)
     logger.addHandler(file_handler)
 
+    # Silence noisy third-party loggers
+    for noisy in ("httpx", "httpcore", "huggingface_hub", "huggingface_hub.utils._http",
+                  "datasets", "datasets.load", "filelock", "urllib3"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
     logging.getLogger(__name__).info(f"Logging to {log_file}")
     return logger
 
