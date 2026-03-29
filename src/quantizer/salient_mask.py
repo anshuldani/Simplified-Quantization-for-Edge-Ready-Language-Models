@@ -179,6 +179,8 @@ class SalientMaskQuantizer:
             )
             param_set = {n for n, _ in self.model.named_parameters()}
             for name, module in self.model.named_modules():
+                if isinstance(module, (nn.Embedding, nn.EmbeddingBag)):
+                    continue
                 param_name = f"{name}.weight"
                 if param_name in param_set:
                     w = dict(module.named_parameters(recurse=False)).get("weight")
