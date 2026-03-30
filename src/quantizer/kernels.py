@@ -264,59 +264,44 @@ def refine_scale_blockwise(
     q_codes: torch.Tensor,
     initial_scales: torch.Tensor,
     dequant_fn,
-    n_iterations: int = 20,
-    lr: float = 0.01,
+    n_iterations: int = 20,   # kept for API compatibility, no longer used
+    lr: float = 0.01,          # kept for API compatibility, no longer used
     block_size: int = 128,
+    level_offset: float = 1.5,
 ) -> torch.Tensor:
     """
-    Minimize L2 reconstruction error via per-block scale optimization.
+    Closed-form optimal per-block scale that minimises L2 reconstruction error.
 
-    min_scale || W_orig - dequant(q_codes, scale) ||_2^2
+    For reconstruction  W ≈ (codes − offset) × s,  the least-squares solution is:
 
-    Uses simple gradient descent per block.
+        s* = (W · L) / (L · L),   where L = codes − offset
 
-    Args:
-        original_weight: Original FP weight tensor
-        q_codes: Quantized integer codes
-        initial_scales: Initial scale estimates
-        dequant_fn: Dequantization function (q_codes, scales) -> float tensor
-        n_iterations: GD steps per block
-        lr: Learning rate
-
-    Returns:
-        Refined scales tensor
+    This replaces the previous approach of creating one Adam optimiser per block
+    (O(n_blocks × n_iterations) individual gradient steps) with a single pair of
+    vectorised dot-products — orders of magnitude faster.
     """
-    scales = initial_scales.clone().float()
-
     w_flat = original_weight.reshape(-1).float()
+    codes_flat = q_codes.reshape(-1).float()
     n = w_flat.numel()
-    n_blocks = scales.numel()
+    n_blocks = initial_scales.numel()
 
-    for i in range(n_blocks):
-        start = i * block_size
-        end = min(start + n // n_blocks, n)  # approximate
-        start = i * (n // n_blocks)
-        end = min(start + n // n_blocks, n)
+    # Pad to an exact multiple of block_size so we can reshape into a matrix
+    pad = (block_size - n % block_size) % block_size
+    if pad:
+        w_padded = torch.cat([w_flat, w_flat.new_zeros(pad)])
+        c_padded = torch.cat([codes_flat, codes_flat.new_zeros(pad)])
+    else:
+        w_padded = w_flat
+        c_padded = codes_flat
 
-        if start >= n:
-            break
+    # [n_blocks, block_size]
+    W = w_padded[: n_blocks * block_size].reshape(n_blocks, block_size)
+    L = c_padded[: n_blocks * block_size].reshape(n_blocks, block_size) - level_offset
 
-        w_block = w_flat[start:end]
-        codes_flat = q_codes.reshape(-1)[start:end].float()
-
-        scale = scales[i:i+1].clone().requires_grad_(True)
-        optimizer = torch.optim.Adam([scale], lr=lr)
-
-        for _ in range(n_iterations):
-            optimizer.zero_grad()
-            # Reconstruct for 2-bit symmetric (most common)
-            reconstructed = (codes_flat - 1.5) * scale
-            loss = (w_block - reconstructed).pow(2).mean()
-            loss.backward()
-            optimizer.step()
-            scale.data.clamp_(min=1e-8)
-
-        scales[i] = scale.data.item()
+    # Optimal scale per block
+    num = (W * L).sum(dim=1)
+    den = (L * L).sum(dim=1).clamp(min=1e-8)
+    scales = (num / den).clamp(min=1e-8)
 
     return scales
 
@@ -361,6 +346,7 @@ def quantize_weight(
                     weight, q_codes, scales,
                     dequant_fn=dequantize_2bit_symmetric,
                     block_size=block_size,
+                    level_offset=1.5,   # 2-bit codes ∈ {0,1,2,3} → levels = codes − 1.5
                 )
             deq_weight = dequantize_2bit_symmetric(q_codes, scales, block_size)
         else:
@@ -376,6 +362,7 @@ def quantize_weight(
                 weight, q_codes, scales,
                 dequant_fn=dequantize_4bit,
                 block_size=block_size,
+                level_offset=7.0,   # 4-bit codes ∈ {0..14} → levels = codes − 7
             )
         deq_weight = dequantize_4bit(q_codes, scales, block_size)
         meta = {"bits": 4, "scales": scales}
