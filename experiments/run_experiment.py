@@ -57,7 +57,7 @@ def load_model_and_tokenizer(model_name: str, device: str = "cuda"):
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.float32,   # FP32 for precise quantization; baselines cast down as needed
         device_map="auto" if device == "cuda" else None,
         trust_remote_code=True,
     )
@@ -352,6 +352,7 @@ def main():
             target_avg_bits=cfg.get("target_avg_bits", 1.61),
             granularity=cfg.get("granularity", "weight"),
         ),
+        block_size=cfg.get("block_size", 64),
         scheme_2bit=cfg.get("quant_scheme", "symmetric"),
         refine_scales=cfg.get("refine_scales", True),
     )
