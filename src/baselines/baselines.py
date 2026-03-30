@@ -19,20 +19,33 @@ import copy
 logger = logging.getLogger(__name__)
 
 
-def _is_quantizable_linear(module: nn.Module) -> bool:
+def _get_embedding_ptrs(model: nn.Module) -> set:
+    """Collect data_ptr() of all embedding weights to detect weight tying."""
+    ptrs = set()
+    for mod in model.modules():
+        if isinstance(mod, (nn.Embedding, nn.EmbeddingBag)):
+            w = getattr(mod, "weight", None)
+            if w is not None:
+                ptrs.add(w.data_ptr())
+    return ptrs
+
+
+def _is_quantizable_linear(module: nn.Module, embedding_ptrs: set = None) -> bool:
     """Return True for nn.Linear and Conv1D-style modules (e.g. GPT-2).
 
-    Matches any module with a 2-D weight parameter that is not an embedding.
+    Matches any module with a 2-D weight parameter that is not an embedding
+    and is not weight-tied to an embedding (e.g. lm_head in GPT-2).
     """
     if isinstance(module, (nn.Embedding, nn.EmbeddingBag)):
         return False
+    w = getattr(module, "weight", None)
+    if w is None:
+        return False
+    if embedding_ptrs and w.data_ptr() in embedding_ptrs:
+        return False  # weight-tied to embedding — skip
     return (
         isinstance(module, nn.Linear)
-        or (
-            hasattr(module, "weight")
-            and isinstance(module.weight, nn.Parameter)
-            and module.weight.dim() == 2
-        )
+        or (isinstance(w, nn.Parameter) and w.dim() == 2)
     )
 
 
@@ -79,10 +92,11 @@ class UniformINT2Baseline:
 
     def apply(self, model: nn.Module) -> nn.Module:
         model = copy.deepcopy(model)
+        embedding_ptrs = _get_embedding_ptrs(model)
 
         n_quantized = 0
         for name, module in tqdm(model.named_modules(), desc="Uniform INT2"):
-            if _is_quantizable_linear(module):
+            if _is_quantizable_linear(module, embedding_ptrs):
                 weight = module.weight.data.float()
                 deq_weight = self._quantize_2bit(weight)
                 module.weight.data = deq_weight.to(module.weight.data.dtype)
@@ -125,10 +139,11 @@ class BitNetTernaryBaseline:
     @staticmethod
     def apply(model: nn.Module) -> nn.Module:
         model = copy.deepcopy(model)
+        embedding_ptrs = _get_embedding_ptrs(model)
         n_quantized = 0
 
         for name, module in tqdm(model.named_modules(), desc="BitNet Ternary"):
-            if _is_quantizable_linear(module):
+            if _is_quantizable_linear(module, embedding_ptrs):
                 weight = module.weight.data.float()
                 deq = BitNetTernaryBaseline._quantize_ternary(weight)
                 module.weight.data = deq.to(module.weight.data.dtype)
