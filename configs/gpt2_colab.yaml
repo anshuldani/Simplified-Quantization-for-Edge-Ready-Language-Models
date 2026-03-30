@@ -15,7 +15,8 @@ calibration_batch_size: 8
 # Our method
 target_avg_bits: 1.61
 granularity: weight
-quant_scheme: symmetric
+block_size: 64            # smaller blocks → tighter per-block scales → less 2-bit error
+quant_scheme: asymmetric  # uses full [min,max] range per block, better for skewed distributions
 refine_scales: true
 salience_metrics:
   - magnitude_l1
