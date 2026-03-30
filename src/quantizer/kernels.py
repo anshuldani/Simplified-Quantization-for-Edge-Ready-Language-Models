@@ -10,6 +10,8 @@ Quantization kernels for 1-bit, 2-bit, and 4-bit precision.
 Also implements:
   - Asymmetric 2-bit variant (ablation)
   - Block-wise scale factor optimization (minimize L2 reconstruction error)
+
+All kernels use fully-vectorized torch matrix ops (no Python loops over blocks).
 """
 
 import torch
@@ -18,6 +20,18 @@ from typing import Optional, Tuple, Literal
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def _pad_and_reshape(w_flat: torch.Tensor, block_size: int) -> Tuple[torch.Tensor, int]:
+    """Pad w_flat to a multiple of block_size and reshape to [n_blocks, block_size]."""
+    n = w_flat.numel()
+    pad = (-n) % block_size
+    if pad:
+        w_padded = torch.cat([w_flat, w_flat.new_zeros(pad)])
+    else:
+        w_padded = w_flat
+    n_blocks = w_padded.numel() // block_size
+    return w_padded.reshape(n_blocks, block_size), n
 
 
 # -----------------------------------------------------------------------
@@ -39,25 +53,17 @@ def quantize_1bit(
     Returns:
         (quantized_weight, scales): same shape as weight, scales [n_blocks]
     """
-    w_flat = weight.reshape(-1)
+    w_flat = weight.reshape(-1).float()
     n = w_flat.numel()
-    n_blocks = (n + block_size - 1) // block_size
 
-    scales = []
-    q_flat = torch.empty_like(w_flat)
+    W, _ = _pad_and_reshape(w_flat, block_size)         # [n_blocks, block_size]
+    scales = W.abs().mean(dim=1).clamp(min=1e-8)        # [n_blocks]
 
-    for i in range(n_blocks):
-        start = i * block_size
-        end = min(start + block_size, n)
-        block = w_flat[start:end]
+    # sign(w) * scale — broadcast scale over block dimension
+    q = W.sign() * scales.unsqueeze(1)                  # [n_blocks, block_size]
+    q_flat = q.reshape(-1)[:n]
 
-        scale = block.abs().mean().clamp(min=1e-8)
-        # Quantize: sign(w) * scale
-        q_flat[start:end] = block.sign() * scale
-        scales.append(scale)
-
-    scales_tensor = torch.stack(scales)
-    return q_flat.reshape(weight.shape), scales_tensor
+    return q_flat.reshape(weight.shape), scales
 
 
 def dequantize_1bit(
@@ -79,7 +85,7 @@ def quantize_2bit_symmetric(
     block_size: int = 128,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Symmetric 2-bit quantization: levels ∈ {-3, -1, +1, +3} * scale/3
+    Symmetric 2-bit quantization: levels ∈ {-1.5s, -0.5s, +0.5s, +1.5s}
     Maps [-max, max] -> 4 uniform levels
 
     Returns:
@@ -90,31 +96,19 @@ def quantize_2bit_symmetric(
     """
     w_flat = weight.reshape(-1).float()
     n = w_flat.numel()
-    n_blocks = (n + block_size - 1) // block_size
 
-    q_codes = torch.empty(n, dtype=torch.uint8, device=weight.device)
-    scales = []
+    W, _ = _pad_and_reshape(w_flat, block_size)             # [n_blocks, block_size]
+    n_blocks = W.shape[0]
+
+    # scale such that max abs value maps to ±1.5 * scale
+    scales = W.abs().max(dim=1).values.clamp(min=1e-8) / 1.5   # [n_blocks]
+
+    # Encode: code = round(w/scale + 1.5), clamped to [0, 3]
+    codes = (W / scales.unsqueeze(1) + 1.5).round().clamp(0, 3).to(torch.uint8)
+    q_codes = codes.reshape(-1)[:n].reshape(weight.shape)
+
     zero_points = torch.zeros(n_blocks, device=weight.device)
-
-    for i in range(n_blocks):
-        start = i * block_size
-        end = min(start + block_size, n)
-        block = w_flat[start:end]
-
-        scale = block.abs().max().clamp(min=1e-8) / 1.5  # max val = 3 * scale / 2
-        # Map to {0,1,2,3}: 0=-max, 1=-scale/3*something, etc
-        # Levels: {-1.5s, -0.5s, +0.5s, +1.5s}
-        # Encode: floor((w/scale + 1.5) * 2/3 * 1.5)
-        codes = torch.clamp(
-            torch.round((block / scale + 1.5) / 1.0),
-            0, 3
-        ).to(torch.uint8)
-
-        q_codes[start:end] = codes
-        scales.append(scale)
-
-    scales_tensor = torch.stack(scales)
-    return q_codes.reshape(weight.shape), scales_tensor, zero_points
+    return q_codes, scales, zero_points
 
 
 def dequantize_2bit_symmetric(
@@ -128,17 +122,11 @@ def dequantize_2bit_symmetric(
     """
     flat_codes = q_codes.reshape(-1).float()
     n = flat_codes.numel()
-    n_blocks = (n + block_size - 1) // block_size
 
-    w_flat = torch.empty(n, dtype=torch.float32, device=q_codes.device)
-
-    for i in range(n_blocks):
-        start = i * block_size
-        end = min(start + block_size, n)
-        codes = flat_codes[start:end]
-        scale = scales[i]
-        # Decode: level = (code - 1.5) * scale
-        w_flat[start:end] = (codes - 1.5) * scale
+    C, _ = _pad_and_reshape(flat_codes, block_size)     # [n_blocks, block_size]
+    # Decode: level = (code - 1.5) * scale
+    w = (C - 1.5) * scales.unsqueeze(1)                 # [n_blocks, block_size]
+    w_flat = w.reshape(-1)[:n]
 
     return w_flat.reshape(q_codes.shape)
 
@@ -153,33 +141,18 @@ def quantize_2bit_asymmetric(
     """
     w_flat = weight.reshape(-1).float()
     n = w_flat.numel()
-    n_blocks = (n + block_size - 1) // block_size
 
-    q_codes = torch.empty(n, dtype=torch.uint8, device=weight.device)
-    scales = []
-    zero_points = []
+    W, _ = _pad_and_reshape(w_flat, block_size)         # [n_blocks, block_size]
 
-    for i in range(n_blocks):
-        start = i * block_size
-        end = min(start + block_size, n)
-        block = w_flat[start:end]
+    w_min = W.min(dim=1).values                         # [n_blocks]
+    w_max = W.max(dim=1).values
+    scales = ((w_max - w_min) / 3.0).clamp(min=1e-8)
+    zero_points = (-w_min / scales).round().clamp(0, 3)
 
-        w_min = block.min()
-        w_max = block.max()
-        scale = (w_max - w_min) / 3.0  # 4 levels -> 3 intervals
-        scale = scale.clamp(min=1e-8)
-        zero_point = torch.round(-w_min / scale).clamp(0, 3)
+    codes = (W / scales.unsqueeze(1) + zero_points.unsqueeze(1)).round().clamp(0, 3).to(torch.uint8)
+    q_codes = codes.reshape(-1)[:n].reshape(weight.shape)
 
-        codes = torch.clamp(torch.round(block / scale + zero_point), 0, 3).to(torch.uint8)
-        q_codes[start:end] = codes
-        scales.append(scale)
-        zero_points.append(zero_point)
-
-    return (
-        q_codes.reshape(weight.shape),
-        torch.stack(scales),
-        torch.stack(zero_points),
-    )
+    return q_codes, scales, zero_points
 
 
 def dequantize_2bit_asymmetric(
@@ -190,13 +163,10 @@ def dequantize_2bit_asymmetric(
 ) -> torch.Tensor:
     flat_codes = q_codes.reshape(-1).float()
     n = flat_codes.numel()
-    n_blocks = (n + block_size - 1) // block_size
-    w_flat = torch.empty(n, dtype=torch.float32, device=q_codes.device)
 
-    for i in range(n_blocks):
-        start = i * block_size
-        end = min(start + block_size, n)
-        w_flat[start:end] = (flat_codes[start:end] - zero_points[i]) * scales[i]
+    C, _ = _pad_and_reshape(flat_codes, block_size)     # [n_blocks, block_size]
+    w = (C - zero_points.unsqueeze(1)) * scales.unsqueeze(1)
+    w_flat = w.reshape(-1)[:n]
 
     return w_flat.reshape(q_codes.shape)
 
@@ -218,23 +188,14 @@ def quantize_4bit(
     """
     w_flat = weight.reshape(-1).float()
     n = w_flat.numel()
-    n_blocks = (n + block_size - 1) // block_size
 
-    q_codes = torch.empty(n, dtype=torch.uint8, device=weight.device)
-    scales = []
+    W, _ = _pad_and_reshape(w_flat, block_size)                  # [n_blocks, block_size]
+    scales = W.abs().max(dim=1).values.clamp(min=1e-8) / 7.0    # [n_blocks]
 
-    for i in range(n_blocks):
-        start = i * block_size
-        end = min(start + block_size, n)
-        block = w_flat[start:end]
+    codes = (W / scales.unsqueeze(1)).round().clamp(-7, 7).add(7).to(torch.uint8)
+    q_codes = codes.reshape(-1)[:n].reshape(weight.shape)
 
-        scale = block.abs().max().clamp(min=1e-8) / 7.0
-        codes = torch.clamp(torch.round(block / scale) + 7, 0, 14).to(torch.uint8)
-
-        q_codes[start:end] = codes
-        scales.append(scale)
-
-    return q_codes.reshape(weight.shape), torch.stack(scales)
+    return q_codes, scales
 
 
 def dequantize_4bit(
@@ -244,13 +205,10 @@ def dequantize_4bit(
 ) -> torch.Tensor:
     flat_codes = q_codes.reshape(-1).float()
     n = flat_codes.numel()
-    n_blocks = (n + block_size - 1) // block_size
-    w_flat = torch.empty(n, dtype=torch.float32, device=q_codes.device)
 
-    for i in range(n_blocks):
-        start = i * block_size
-        end = min(start + block_size, n)
-        w_flat[start:end] = (flat_codes[start:end] - 7.0) * scales[i]
+    C, _ = _pad_and_reshape(flat_codes, block_size)     # [n_blocks, block_size]
+    w = (C - 7.0) * scales.unsqueeze(1)
+    w_flat = w.reshape(-1)[:n]
 
     return w_flat.reshape(q_codes.shape)
 
