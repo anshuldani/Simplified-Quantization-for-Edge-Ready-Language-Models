@@ -97,8 +97,9 @@ class BitAllocator:
         logger.info("Weight-wise allocation: flattening salience scores...")
 
         names = list(salience_map.keys())
-        # Move to CPU for consistent sorting (salience may be on CUDA)
-        flat_parts = [salience_map[n].float().cpu().flatten() for n in names]
+        # Keep on the same device as the first salience tensor for fast topk
+        device = next(iter(salience_map.values())).device
+        flat_parts = [salience_map[n].float().to(device).flatten() for n in names]
         sizes = [p.numel() for p in flat_parts]
         offsets = [0] + list(np.cumsum(sizes))
 
@@ -114,7 +115,7 @@ class BitAllocator:
                     f"({target_total_bits:.0f} total bits)")
         logger.info(f"Starting at {min_bits}-bit ({current_total_bits:.0f} bits)")
 
-        bits_flat = torch.full((total_params,), min_bits, dtype=torch.uint8)
+        bits_flat = torch.full((total_params,), min_bits, dtype=torch.uint8, device=device)
 
         for target_bits in sorted(set(self.config.bit_choices) - {min_bits}):
             budget = target_total_bits - current_total_bits
