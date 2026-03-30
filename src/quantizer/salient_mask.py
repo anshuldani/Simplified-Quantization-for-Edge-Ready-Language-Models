@@ -156,35 +156,60 @@ class SalientMaskQuantizer:
         return self.model
 
     def _get_quantizable_params(self) -> list:
-        """Get all weight matrix param names for target layer types.
+        """Get all weight matrix param names to quantize.
 
-        Falls back to matching any module with a 2-D weight tensor when
-        target_layer_types don't match (e.g. HuggingFace Conv1D in GPT-2).
+        Excludes:
+          - nn.Embedding / nn.EmbeddingBag layers
+          - Any layer whose weight is tied to an embedding (e.g. lm_head in GPT-2
+            shares data_ptr with transformer.wte.weight — quantizing it would
+            silently destroy the token embeddings)
+
+        Falls back to matching any 2-D weight module when target_layer_types
+        doesn't match (e.g. HuggingFace Conv1D in GPT-2).
         """
-        # First try the configured layer types
+        # Collect data_ptrs of all embedding weights to detect weight tying
+        embedding_ptrs: set = set()
+        for _, mod in self.model.named_modules():
+            if isinstance(mod, (nn.Embedding, nn.EmbeddingBag)):
+                w = getattr(mod, "weight", None)
+                if w is not None:
+                    embedding_ptrs.add(w.data_ptr())
+
+        def _safe(mod: nn.Module) -> bool:
+            """Return True if this module's weight is safe to quantize."""
+            if isinstance(mod, (nn.Embedding, nn.EmbeddingBag)):
+                return False
+            w = getattr(mod, "weight", None)
+            if w is None:
+                return False
+            if w.data_ptr() in embedding_ptrs:  # weight-tied to embedding
+                return False
+            return True
+
+        param_set = {n for n, _ in self.model.named_parameters()}
+
+        # Primary: try configured layer types
         params = []
         for name, module in self.model.named_modules():
-            if isinstance(module, self.config.target_layer_types):
+            if isinstance(module, self.config.target_layer_types) and _safe(module):
                 param_name = f"{name}.weight"
-                if any(n == param_name for n, _ in self.model.named_parameters()):
+                if param_name in param_set:
                     params.append(param_name)
 
-        # Fallback: if nothing matched, collect any module with a 2-D weight
-        # (covers nn.Linear and transformers Conv1D alike)
+        # Fallback: any module with a 2-D weight (covers Conv1D)
         if not params:
             logger.warning(
-                "No layers matched target_layer_types=%s; "
-                "falling back to any module with a 2-D weight parameter.",
+                "No non-tied layers matched target_layer_types=%s; "
+                "falling back to 2-D weight scan (covers Conv1D etc.).",
                 self.config.target_layer_types,
             )
-            param_set = {n for n, _ in self.model.named_parameters()}
             for name, module in self.model.named_modules():
-                if isinstance(module, (nn.Embedding, nn.EmbeddingBag)):
+                if not _safe(module):
                     continue
                 param_name = f"{name}.weight"
                 if param_name in param_set:
-                    w = dict(module.named_parameters(recurse=False)).get("weight")
-                    if w is not None and w.dim() == 2:
+                    w = getattr(module, "weight")
+                    if w.dim() == 2:
                         params.append(param_name)
 
         return params
@@ -224,8 +249,10 @@ class SalientMaskQuantizer:
                 self.quantization_meta[param_name] = meta
 
             else:
-                # Mixed-precision within this layer
-                # Quantize each bit-group separately, combine
+                # Mixed-precision within this layer.
+                # Extract each bit-group's actual weights (no zero-padding) so
+                # the scale is computed from the real weight distribution, not
+                # diluted by zeros from masked-out positions.
                 deq_weight = torch.empty_like(original_weight)
 
                 for bits in [int(b) for b in unique_bits]:
@@ -233,18 +260,15 @@ class SalientMaskQuantizer:
                     if not mask.any():
                         continue
 
-                    # Extract this bit-group's weights
-                    group_weights = original_weight.clone()
-                    group_weights[~mask] = 0.0
-
+                    group_flat = original_weight[mask]          # 1-D, actual weights only
                     group_deq, meta = quantize_weight(
-                        group_weights,
+                        group_flat.unsqueeze(0),                # [1, n_group]
                         bits=bits,
                         scheme=self.config.scheme_2bit,
                         block_size=self.config.block_size,
                         refine_scales=self.config.refine_scales,
                     )
-                    deq_weight[mask] = group_deq[mask].to(deq_weight.dtype)
+                    deq_weight[mask] = group_deq.reshape(-1).to(deq_weight.dtype)
 
                 # Fill unquantized positions (shouldn't exist, but safety)
                 param.data.copy_(deq_weight.to(param.data.dtype))
