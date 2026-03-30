@@ -92,23 +92,16 @@ class UniformINT2Baseline:
         return model
 
     def _quantize_2bit(self, weight: torch.Tensor) -> torch.Tensor:
-        """Symmetric 2-bit quantization with per-block scale."""
+        """Symmetric 2-bit quantization with per-block scale (vectorized)."""
         w_flat = weight.reshape(-1)
         n = w_flat.numel()
-        n_blocks = (n + self.block_size - 1) // self.block_size
-        out = torch.empty_like(w_flat)
-
-        for i in range(n_blocks):
-            start = i * self.block_size
-            end = min(start + self.block_size, n)
-            block = w_flat[start:end]
-
-            scale = block.abs().max().clamp(min=1e-8) / 1.5
-            codes = torch.clamp(torch.round((block / scale + 1.5)), 0, 3)
-            deq = (codes - 1.5) * scale
-            out[start:end] = deq
-
-        return out.reshape(weight.shape)
+        pad = (-n) % self.block_size
+        w_padded = torch.cat([w_flat, w_flat.new_zeros(pad)]) if pad else w_flat
+        W = w_padded.reshape(-1, self.block_size)               # [n_blocks, block_size]
+        scales = W.abs().max(dim=1).values.clamp(min=1e-8) / 1.5
+        codes = (W / scales.unsqueeze(1) + 1.5).round().clamp(0, 3)
+        deq = (codes - 1.5) * scales.unsqueeze(1)
+        return deq.reshape(-1)[:n].reshape(weight.shape)
 
     def name(self) -> str:
         return "uniform_int2"
