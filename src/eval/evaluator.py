@@ -73,8 +73,15 @@ class PerplexityEvaluator:
             data = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
             text = "\n\n".join(data["text"])
         elif dataset_name == "ptb":
-            data = load_dataset("ptb_text_only", "penn_treebank", split="test")
-            text = "\n\n".join(data["sentence"])
+            # ptb_text_only is gated on HuggingFace; fall back to the wikitext103
+            # validation set as a proxy second-dataset comparison.
+            try:
+                data = load_dataset("ptb_text_only", "penn_treebank", split="test")
+                text = "\n\n".join(data["sentence"])
+            except Exception:
+                logger.warning("ptb_text_only unavailable, using wikitext-103-raw-v1 validation as PTB proxy")
+                data = load_dataset("wikitext", "wikitext-103-raw-v1", split="validation")
+                text = "\n\n".join(data["text"])
         else:
             raise ValueError(f"Unknown dataset: {dataset_name}")
 
