@@ -86,15 +86,27 @@ class BitAllocator:
         salience_map: Dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
         """
-        Per-element bit allocation.
-        Globally sorts ALL weights by salience and upgrades greedily.
+        Per-element bit allocation using vectorized torch operations.
+
+        Replaces the previous O(n²) Python-loop approach (which built a list of
+        85M tuples and sorted them in pure Python) with:
+          1. torch.cat  — flatten all salience scores in one shot
+          2. torch.topk — find the top-k weights to upgrade (C++ kernel, O(n log k))
+          3. index assignment — apply upgrades in a single tensor op
         """
-        # Step 1: Flatten all salience scores with location metadata
         logger.info("Weight-wise allocation: flattening salience scores...")
 
-        total_params = sum(s.numel() for s in salience_map.values())
-        target_total_bits = self.config.target_avg_bits * total_params
+        names = list(salience_map.keys())
+        # Move to CPU for consistent sorting (salience may be on CUDA)
+        flat_parts = [salience_map[n].float().cpu().flatten() for n in names]
+        sizes = [p.numel() for p in flat_parts]
+        offsets = [0] + list(np.cumsum(sizes))
+
+        all_scores = torch.cat(flat_parts)          # [total_params]
+        total_params = all_scores.numel()
+
         min_bits = min(self.config.bit_choices)
+        target_total_bits = self.config.target_avg_bits * total_params
         current_total_bits = float(min_bits * total_params)
 
         logger.info(f"Total params: {total_params:,}")
@@ -102,63 +114,46 @@ class BitAllocator:
                     f"({target_total_bits:.0f} total bits)")
         logger.info(f"Starting at {min_bits}-bit ({current_total_bits:.0f} bits)")
 
-        # Initialize all weights to min bits
-        bit_map: Dict[str, torch.Tensor] = {
-            name: torch.full(scores.shape, min_bits, dtype=torch.uint8)
-            for name, scores in salience_map.items()
-        }
+        bits_flat = torch.full((total_params,), min_bits, dtype=torch.uint8)
 
-        # Sort bit upgrades: [1->2, 2->4]
-        bit_upgrades = sorted(set(self.config.bit_choices) - {min_bits})
-
-        for target_bits in bit_upgrades:
-            # For this upgrade level, sort all not-yet-upgraded weights globally
-            budget_remaining = target_total_bits - current_total_bits
-            if budget_remaining <= 0:
+        for target_bits in sorted(set(self.config.bit_choices) - {min_bits}):
+            budget = target_total_bits - current_total_bits
+            if budget <= 0:
                 logger.info(f"Budget exhausted before {target_bits}-bit upgrades")
                 break
 
-            bits_gained_per_upgrade = target_bits - min_bits
-            max_upgrades = int(budget_remaining / bits_gained_per_upgrade)
-
-            logger.info(f"Upgrading up to {max_upgrades:,} weights to {target_bits}-bit "
-                        f"(budget: {budget_remaining:.0f} bits)")
-
+            gain = target_bits - min_bits
+            max_upgrades = int(budget / gain)
             if max_upgrades == 0:
                 continue
 
-            # Collect all upgradeable weights with their salience scores
-            # (those currently at min_bits)
-            all_scores = []  # (salience_value, param_name, flat_index)
+            upgradeable = (bits_flat == min_bits)
+            n_upgradeable = int(upgradeable.sum().item())
+            k = min(max_upgrades, n_upgradeable)
 
-            for name, scores in salience_map.items():
-                current_bits = bit_map[name]
-                mask = (current_bits == min_bits)
-                flat_scores = scores[mask].float()
-                flat_indices = mask.nonzero(as_tuple=True)
+            logger.info(f"Upgrading up to {k:,} weights to {target_bits}-bit "
+                        f"(budget: {budget:.0f} bits)")
 
-                for i, score_val in enumerate(flat_scores):
-                    idx = tuple(fi[i].item() for fi in flat_indices)
-                    all_scores.append((score_val.item(), name, idx))
+            if k == 0:
+                break
 
-            # Sort by salience descending, take top max_upgrades
-            all_scores.sort(key=lambda x: x[0], reverse=True)
-            to_upgrade = all_scores[:max_upgrades]
+            # Mask non-upgradeable positions out with -inf, then topk
+            masked = all_scores.masked_fill(~upgradeable, float("-inf"))
+            _, top_idx = masked.topk(k)
+            bits_flat[top_idx] = target_bits
+            current_total_bits += k * gain
 
-            # Apply upgrades
-            upgrade_counts: Dict[str, int] = {}
-            for _, param_name, idx in to_upgrade:
-                bit_map[param_name][idx] = target_bits
-                upgrade_counts[param_name] = upgrade_counts.get(param_name, 0) + 1
+            logger.info(f"Upgraded {k:,} weights to {target_bits}-bit "
+                        f"(avg: {current_total_bits / total_params:.4f})")
 
-            bits_used = len(to_upgrade) * bits_gained_per_upgrade
-            current_total_bits += bits_used
+        logger.info(f"Final avg bits: {current_total_bits / total_params:.4f} "
+                    f"(target: {self.config.target_avg_bits})")
 
-            logger.info(f"Upgraded {len(to_upgrade):,} weights to {target_bits}-bit "
-                        f"(actual avg: {current_total_bits / total_params:.4f})")
-
-        achieved_avg = current_total_bits / total_params
-        logger.info(f"Final avg bits: {achieved_avg:.4f} (target: {self.config.target_avg_bits})")
+        # Reshape back into per-param tensors
+        bit_map: Dict[str, torch.Tensor] = {}
+        for i, name in enumerate(names):
+            start, end = offsets[i], offsets[i + 1]
+            bit_map[name] = bits_flat[start:end].reshape(salience_map[name].shape)
 
         return bit_map
 
