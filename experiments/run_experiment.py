@@ -34,6 +34,7 @@ from src.salience.metrics import SalienceConfig
 from src.quantizer.allocator import AllocationConfig
 from src.quantizer.salient_mask import QuantizerConfig, SalientMaskQuantizer
 from src.baselines.baselines import UniformINT2Baseline, BitNetTernaryBaseline, FP16Baseline
+from src.baselines.gptq_runner import GPTQRunner, prepare_gptq_calibration
 from src.eval.evaluator import ModelEvaluator
 from src.utils.data import get_c4_calibration_dataloader
 from src.utils.logging_utils import setup_logging, ResultsTracker
@@ -84,6 +85,7 @@ def run_baseline_experiments(
     output_dir: str,
     tracker: ResultsTracker,
     max_eval_tokens: Optional[int] = None,
+    run_gptq: bool = False,
 ):
     """Run all baseline experiments."""
     baselines = {
@@ -115,6 +117,28 @@ def run_baseline_experiments(
         tracker.add_result(baseline_name, results)
         del quantized, base_model
         torch.cuda.empty_cache()
+
+    # GPTQ baseline (optional — requires auto-gptq)
+    if run_gptq:
+        logger.info("\nRunning baseline: gptq_4bit")
+        try:
+            gptq_samples = prepare_gptq_calibration(calibration_dataloader, n_samples=128)
+            runner = GPTQRunner(model_name, bits=4, group_size=128)
+            quantized = runner.run(gptq_samples)
+            evaluator = ModelEvaluator(quantized, tokenizer, device)
+            results = evaluator.evaluate_all(
+                run_mmlu=run_mmlu,
+                run_latency=run_latency,
+                run_perplexity=True,
+                datasets=eval_datasets,
+                max_eval_tokens=max_eval_tokens,
+            )
+            results["avg_bits"] = GPTQRunner.avg_bits()
+            tracker.add_result("gptq_4bit", results)
+            del quantized
+            torch.cuda.empty_cache()
+        except Exception as e:
+            logger.warning(f"GPTQ baseline failed: {e}")
 
 
 def run_ours(
@@ -261,7 +285,7 @@ def _get_ablation_configs(ablation_type: str) -> Dict[str, QuantizerConfig]:
         )
 
     elif ablation_type == "bit_budget":
-        for target_bits in [1.0, 1.3, 1.61, 2.0, 2.5]:
+        for target_bits in [1.0, 1.3, 1.61, 2.0, 2.5, 3.0, 4.0]:
             configs[f"target_{target_bits}b"] = QuantizerConfig(
                 allocation=AllocationConfig(target_avg_bits=target_bits)
             )
@@ -284,6 +308,30 @@ def _get_ablation_configs(ablation_type: str) -> Dict[str, QuantizerConfig]:
         for scheme in ["symmetric", "asymmetric"]:
             configs[scheme] = QuantizerConfig(
                 scheme_2bit=scheme,
+                allocation=AllocationConfig(target_avg_bits=1.61),
+            )
+
+    elif ablation_type == "ensemble_weights":
+        # Vary the ensemble α weights to understand metric contributions
+        weight_configs = {
+            "magnitude_heavy":  (0.30, 0.30, 0.15, 0.15, 0.10),
+            "gradient_heavy":   (0.10, 0.10, 0.40, 0.30, 0.10),
+            "hessian_heavy":    (0.10, 0.10, 0.20, 0.50, 0.10),
+            "activation_heavy": (0.10, 0.10, 0.15, 0.15, 0.50),
+            "uniform":          (0.20, 0.20, 0.20, 0.20, 0.20),
+            "default":          (0.15, 0.15, 0.25, 0.25, 0.20),
+        }
+        for name, (al1, al2, ag, ah, aa) in weight_configs.items():
+            sal_config = SalienceConfig(
+                metrics=["magnitude_l1", "magnitude_l2", "gradient", "hessian", "activation"],
+                alpha_magnitude_l1=al1,
+                alpha_magnitude_l2=al2,
+                alpha_gradient=ag,
+                alpha_hessian=ah,
+                alpha_activation=aa,
+            )
+            configs[name] = QuantizerConfig(
+                salience=sal_config,
                 allocation=AllocationConfig(target_avg_bits=1.61),
             )
 
@@ -367,6 +415,7 @@ def main():
             model_name, tokenizer, calibration_dataloader,
             eval_datasets, device, run_mmlu, run_latency, output_dir, tracker,
             max_eval_tokens=max_eval_tokens,
+            run_gptq=cfg.get("run_gptq", False),
         )
 
     if "ours" in run_types:
