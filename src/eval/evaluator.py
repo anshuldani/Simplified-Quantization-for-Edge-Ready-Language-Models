@@ -8,6 +8,7 @@ Evaluation suite for quantized models:
   4. Memory (VRAM) profiling
 """
 
+import contextlib
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
@@ -109,8 +110,8 @@ class PerplexityEvaluator:
 
                 autocast_ctx = (
                     torch.amp.autocast("cuda")
-                    if self.device == "cuda"
-                    else torch.amp.autocast("cpu", enabled=False)
+                    if self.device == "cuda" and torch.cuda.is_available()
+                    else contextlib.nullcontext()
                 )
                 with autocast_ctx:
                     outputs = self.model(input_ids_chunk, labels=input_ids_chunk)
