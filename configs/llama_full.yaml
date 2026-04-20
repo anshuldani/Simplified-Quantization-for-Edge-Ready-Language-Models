@@ -36,6 +36,8 @@ run:
   - ours
   - ablations
 
+run_gptq: true               # include GPTQ-4bit baseline (requires auto-gptq)
+
 # All 6 ablation studies (Milestone C)
 ablation_types:
   - salience_metric
