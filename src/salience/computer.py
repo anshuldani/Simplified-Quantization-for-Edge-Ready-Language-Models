@@ -118,7 +118,7 @@ class SalienceComputer:
         logger.info(f"Running calibration forward passes ({n_target} samples)...")
 
         with torch.set_grad_enabled(needs_grad):
-            for batch in tqdm(dataloader, desc="Calibration", total=len(dataloader)):
+            for batch_idx, batch in enumerate(tqdm(dataloader, desc="Calibration", total=len(dataloader))):
                 if n_samples >= n_target:
                     break
 
@@ -128,7 +128,7 @@ class SalienceComputer:
                     attention_mask = attention_mask.to(self.device)
 
                 if needs_grad:
-                    self.model.zero_grad()
+                    self.model.zero_grad(set_to_none=True)
 
                 # Forward pass — use causal LM loss for gradient signal
                 outputs = self.model(
@@ -143,6 +143,14 @@ class SalienceComputer:
 
                     if "hessian" in self.config.metrics:
                         self.hessian_metric.accumulate(self.model)
+
+                    # Free gradient tensors immediately after accumulation
+                    self.model.zero_grad(set_to_none=True)
+
+                # Release output tensors and periodically flush CUDA cache
+                del outputs, loss
+                if batch_idx % 10 == 0 and self.device == "cuda":
+                    torch.cuda.empty_cache()
 
                 n_samples += input_ids.shape[0]
 
