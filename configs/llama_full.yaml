@@ -6,10 +6,10 @@ model_name: meta-llama/Llama-3.2-1B
 output_dir: results/llama_full
 device: cuda
 
-# Calibration (full as per proposal)
-n_calibration_samples: 512
-calibration_seq_len: 512
-calibration_batch_size: 2     # smaller batch for larger model
+# Calibration — reduced for T4 (16 GB) OOM avoidance on 1B model
+n_calibration_samples: 256
+calibration_seq_len: 256
+calibration_batch_size: 1
 
 # Our method
 target_avg_bits: 1.61
