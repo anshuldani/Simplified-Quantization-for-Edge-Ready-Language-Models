@@ -16,6 +16,10 @@ Usage:
 import os
 import sys
 import json
+import gc
+
+# Reduce CUDA memory fragmentation — critical for large models on T4
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 import yaml
 import copy
 import logging
@@ -115,7 +119,8 @@ def run_baseline_experiments(
         results["avg_bits"] = baseline.avg_bits()
 
         tracker.add_result(baseline_name, results)
-        del quantized, base_model
+        del quantized, base_model, evaluator, results
+        gc.collect()
         torch.cuda.empty_cache()
 
     # GPTQ baseline (optional — requires auto-gptq)
@@ -197,7 +202,8 @@ def run_ours(
 
     tracker.add_result("ours", eval_results)
 
-    del base_model
+    del base_model, quantizer, evaluator
+    gc.collect()
     torch.cuda.empty_cache()
     return eval_results
 
@@ -250,7 +256,8 @@ def run_ablation_study(
         }
         logger.info(f"    PPL: {ppl:.2f}, avg bits: {results['avg_bits']:.3f}")
 
-        del base_model
+        del base_model, quantizer, evaluator, results
+        gc.collect()
         torch.cuda.empty_cache()
 
     # Save and plot
