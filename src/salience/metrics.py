@@ -91,8 +91,8 @@ class GradientSalience:
 
     def _accumulate_grad(self, name: str, grad: torch.Tensor):
         if name not in self._grad_accumulator:
-            self._grad_accumulator[name] = torch.zeros_like(grad)
-        self._grad_accumulator[name] += grad.abs()
+            self._grad_accumulator[name] = torch.zeros(grad.shape, dtype=torch.float32)
+        self._grad_accumulator[name] += grad.abs().cpu().float()
 
     def remove_hooks(self):
         for hook in self._hooks:
@@ -134,9 +134,9 @@ class HessianSalience:
         """
         for name, param in model.named_parameters():
             if param.grad is not None:
-                grad_sq = param.grad.data.pow(2)
+                grad_sq = param.grad.data.pow(2).cpu().float()
                 if name not in self._fisher_accumulator:
-                    self._fisher_accumulator[name] = torch.zeros_like(param.data)
+                    self._fisher_accumulator[name] = torch.zeros(param.data.shape, dtype=torch.float32)
                 self._fisher_accumulator[name] += grad_sq
         self._n_samples += 1
 
