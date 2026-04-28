@@ -18,6 +18,7 @@ from typing import Dict, Optional, Tuple
 from dataclasses import dataclass, field
 from tqdm import tqdm
 import logging
+import gc
 import time
 import json
 import os
@@ -121,6 +122,9 @@ class SalientMaskQuantizer:
         self.timing["phase1_salience"] = time.time() - t0
         logger.info(f"Phase 1 complete in {self.timing['phase1_salience']:.1f}s")
 
+        if self.device == "cuda":
+            torch.cuda.empty_cache()
+
         # Log global salience stats
         stats = self.salience_computer.get_salience_stats(self.salience_map)
         if "_global" in stats:
@@ -129,8 +133,12 @@ class SalientMaskQuantizer:
                         f"p80={g['p80']:.4f}, total_params={g['total_params']:,}")
 
         # ---- Phase 2: Bit allocation ----
+        gc.collect()  # free Phase 1 temporaries before allocation
         logger.info("\n[Phase 2] Greedy bit allocation...")
         t0 = time.time()
+        if self.device == "cuda":
+            gc.collect()
+            torch.cuda.empty_cache()
         self.bit_map = self.bit_allocator.allocate(self.salience_map)
         self.timing["phase2_allocation"] = time.time() - t0
 
@@ -143,6 +151,8 @@ class SalientMaskQuantizer:
             logger.info(f"  {b_key}: {dist['count']:,} ({dist['pct']:.1f}%)")
 
         # ---- Phase 3: Mixed-precision quantization ----
+        if self.device == "cuda":
+            torch.cuda.empty_cache()
         logger.info("\n[Phase 3] Applying mixed-precision quantization...")
         t0 = time.time()
         self._apply_quantization(target_params)
