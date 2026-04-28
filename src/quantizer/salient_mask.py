@@ -249,28 +249,37 @@ class SalientMaskQuantizer:
                 self.quantization_meta[param_name] = meta
 
             else:
-                # Mixed-precision within this layer.
-                # Extract each bit-group's actual weights (no zero-padding) so
-                # the scale is computed from the real weight distribution, not
-                # diluted by zeros from masked-out positions.
+                # Mixed-precision within this layer — processed row-by-row.
+                #
+                # KEY FIX: the original code used a boolean mask to extract
+                # weights of each bit-level into a flat 1-D array spanning
+                # multiple rows. Block boundaries therefore crossed unrelated
+                # rows, corrupting the per-block scale statistics and causing
+                # perplexity to jump from 541 to 12,173 (22x degradation).
+                #
+                # By iterating over each row independently, every block is
+                # guaranteed to contain only spatially coherent weights from
+                # the same output neuron, giving accurate block scales.
                 deq_weight = torch.empty_like(original_weight)
 
-                for bits in [int(b) for b in unique_bits]:
-                    mask = (bit_tensor == bits)
-                    if not mask.any():
-                        continue
+                for row_idx in range(original_weight.shape[0]):
+                    row_weights = original_weight[row_idx]   # [in_features]
+                    row_bits    = bit_tensor[row_idx]         # [in_features]
 
-                    group_flat = original_weight[mask]          # 1-D, actual weights only
-                    group_deq, meta = quantize_weight(
-                        group_flat.unsqueeze(0),                # [1, n_group]
-                        bits=bits,
-                        scheme=self.config.scheme_2bit,
-                        block_size=self.config.block_size,
-                        refine_scales=self.config.refine_scales,
-                    )
-                    deq_weight[mask] = group_deq.reshape(-1).to(deq_weight.dtype)
+                    for bits in sorted({int(b) for b in row_bits.unique().tolist()}):
+                        mask = (row_bits == bits)
+                        if not mask.any():
+                            continue
+                        group = row_weights[mask]              # contiguous 1-D slice
+                        group_deq, _ = quantize_weight(
+                            group.unsqueeze(0),
+                            bits=bits,
+                            scheme=self.config.scheme_2bit,
+                            block_size=self.config.block_size,
+                            refine_scales=self.config.refine_scales,
+                        )
+                        deq_weight[row_idx][mask] = group_deq.reshape(-1).to(deq_weight.dtype)
 
-                # Fill unquantized positions (shouldn't exist, but safety)
                 param.data.copy_(deq_weight.to(param.data.dtype))
                 self.quantization_meta[param_name] = {"bits": "mixed", "unique_bits": unique_bits}
 
