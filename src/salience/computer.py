@@ -139,7 +139,7 @@ class SalienceComputer:
                 loss = outputs.loss
 
                 if needs_grad and loss is not None:
-                    loss.backward()
+                    loss.float().backward()  # cast to float32 to prevent NaN gradients in FP16
 
                     if "hessian" in self.config.metrics:
                         self.hessian_metric.accumulate(self.model)
