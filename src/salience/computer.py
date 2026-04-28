@@ -228,7 +228,7 @@ class SalienceComputer:
         """Compute quantiles safely — torch.quantile fails on CUDA for >2^24 elements."""
         MAX = 2 ** 24
         if t.numel() > MAX:
-            idx = torch.randperm(t.numel(), device=t.device)[:MAX]
+            idx = torch.randint(0, t.numel(), (MAX,))  # randperm on 1.2B elements = 9.6 GB; randint uses O(sample) memory
             t = t[idx]
         return [t.quantile(q).item() for q in qs]
 
