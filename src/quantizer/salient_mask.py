@@ -229,7 +229,7 @@ class SalientMaskQuantizer:
             if param is None:
                 continue
 
-            original_weight = param.data.clone()
+            original_weight = param.data.float().clone()  # upcast to float32 for quantization precision
             bit_tensor = self.bit_map[param_name]
 
             # Check if all weights have same bit width (fast path)
