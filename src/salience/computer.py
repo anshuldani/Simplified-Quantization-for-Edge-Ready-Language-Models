@@ -237,13 +237,21 @@ class SalienceComputer:
         return [t.quantile(q).item() for q in qs]
 
     def get_salience_stats(self, salience_map: Dict[str, torch.Tensor]) -> Dict:
-        """Compute summary statistics for logging/visualization."""
+        """Streaming stats: avoids torch.cat on full 3.9 GB salience tensor.
+
+        Uses per-layer accumulators for mean/std and a 4M-element reservoir
+        sample for the global p80 threshold — accurate enough for logging
+        without ever materialising the full flat array.
+        """
         stats = {}
-        all_scores = []
+        RESERVOIR = 2 ** 22  # 4M elements (~16 MB)
+        reservoir_parts = []
+        reservoir_remaining = RESERVOIR
+        g_sum = 0.0; g_sum_sq = 0.0; g_count = 0
 
         for name, scores in salience_map.items():
-            flat = scores.flatten().float()
-            all_scores.append(flat)
+            flat = scores.flatten().float().cpu()
+            n = flat.numel()
             p25, p50, p75, p95 = self._quantiles(flat, [0.25, 0.50, 0.75, 0.95])
             stats[name] = {
                 "mean": flat.mean().item(),
@@ -254,17 +262,29 @@ class SalienceComputer:
                 "p50": p50,
                 "p75": p75,
                 "p95": p95,
-                "numel": flat.numel(),
+                "numel": n,
             }
+            g_sum    += flat.sum().item()
+            g_sum_sq += flat.pow(2).sum().item()
+            g_count  += n
+            if reservoir_remaining > 0:
+                take = min(n, reservoir_remaining)
+                idx  = torch.randint(0, n, (take,))
+                reservoir_parts.append(flat[idx].clone())
+                reservoir_remaining -= take
+            del flat
 
-        if all_scores:
-            global_flat = torch.cat(all_scores)
-            p80, = self._quantiles(global_flat, [0.80])
+        if g_count > 0:
+            g_mean = g_sum / g_count
+            g_std  = max(g_sum_sq / g_count - g_mean ** 2, 0.0) ** 0.5
+            reservoir = torch.cat(reservoir_parts) if reservoir_parts else torch.tensor([0.0])
+            p80, = self._quantiles(reservoir, [0.80])
+            del reservoir, reservoir_parts
             stats["_global"] = {
-                "mean": global_flat.mean().item(),
-                "std": global_flat.std().item(),
-                "p80": p80,  # 80/20 threshold
-                "total_params": global_flat.numel(),
+                "mean": g_mean,
+                "std": g_std,
+                "p80": p80,
+                "total_params": g_count,
             }
 
         return stats
