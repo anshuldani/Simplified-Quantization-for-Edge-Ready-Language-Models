@@ -162,6 +162,9 @@ class SalienceComputer:
         if "activation" in self.config.metrics:
             self.activation_metric.remove_hooks()
 
+        if self.device == "cuda":
+            torch.cuda.empty_cache()
+
         # ------- Phase 4: Assemble per-param salience -------
         salience_map: Dict[str, torch.Tensor] = {}
 
@@ -193,11 +196,12 @@ class SalienceComputer:
             if "activation" in self.config.metrics:
                 scores["activation"] = self.activation_metric.compute(weight, layer_name)
 
-            # Ensemble combination
+            # Ensemble combination — store on CPU to free GPU VRAM
             if len(scores) == 1:
-                salience_map[param_name] = list(scores.values())[0]
+                salience_map[param_name] = list(scores.values())[0].cpu()
             else:
-                salience_map[param_name] = self.ensemble.combine(scores)
+                salience_map[param_name] = self.ensemble.combine(scores).cpu()
+            del scores
 
         # Cleanup
         self.gradient_metric.reset()
