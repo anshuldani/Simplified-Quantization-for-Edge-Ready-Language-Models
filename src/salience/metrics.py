@@ -108,7 +108,7 @@ class GradientSalience:
             logger.warning(f"No gradient found for {param_name}, using magnitude fallback")
             return weight.abs()
 
-        grad = self._grad_accumulator[param_name]
+        grad = self._grad_accumulator[param_name].to(weight.device)
         return (weight.abs() * grad).detach()
 
     def reset(self):
@@ -150,7 +150,7 @@ class HessianSalience:
             return weight.abs()
 
         fisher = self._fisher_accumulator[param_name] / self._n_samples
-        return fisher.detach()
+        return fisher.to(weight.device).detach()
 
     def reset(self):
         self._fisher_accumulator.clear()
