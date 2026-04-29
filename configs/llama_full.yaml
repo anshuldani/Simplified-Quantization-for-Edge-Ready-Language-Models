@@ -14,8 +14,9 @@ calibration_batch_size: 1
 # Our method
 target_avg_bits: 1.61
 granularity: weight
-quant_scheme: symmetric
+quant_scheme: asymmetric
 refine_scales: true
+block_size: 32               # matches GPT-2 tuned config
 salience_metrics:
   - magnitude_l1
   - magnitude_l2
@@ -36,7 +37,7 @@ run:
   - ours
   - ablations
 
-run_gptq: true               # include GPTQ-4bit baseline (requires auto-gptq)
+run_gptq: false              # disabled — flaky auto-gptq install on T4
 
 # All 6 ablation studies (Milestone C)
 ablation_types:
