@@ -148,11 +148,10 @@ class SalienceComputer:
                     self.model.zero_grad(set_to_none=True)
 
                 # Release output tensors and periodically flush CUDA cache
+                n_samples += input_ids.shape[0]
                 del outputs, loss, input_ids
                 if self.device == "cuda":
                     torch.cuda.empty_cache()  # flush every batch — LLaMA backward = 2.5 GB transient
-
-                n_samples += input_ids.shape[0]
 
         logger.info(f"Calibration complete ({n_samples} samples processed)")
 
