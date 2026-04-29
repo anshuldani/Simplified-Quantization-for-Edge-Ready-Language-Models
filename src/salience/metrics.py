@@ -108,8 +108,8 @@ class GradientSalience:
             logger.warning(f"No gradient found for {param_name}, using magnitude fallback")
             return weight.abs()
 
-        grad = self._grad_accumulator[param_name].to(weight.device)
-        return (weight.abs() * grad).detach()
+        grad = self._grad_accumulator[param_name]  # already on CPU
+        return (weight.cpu().abs() * grad).detach()  # multiply on CPU; result stored as .cpu() by caller
 
     def reset(self):
         self._grad_accumulator.clear()
@@ -150,7 +150,7 @@ class HessianSalience:
             return weight.abs()
 
         fisher = self._fisher_accumulator[param_name] / self._n_samples
-        return fisher.to(weight.device).detach()
+        return fisher.detach()  # already on CPU; caller does .cpu() anyway
 
     def reset(self):
         self._fisher_accumulator.clear()
