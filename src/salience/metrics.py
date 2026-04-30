@@ -90,9 +90,13 @@ class GradientSalience:
                 self._hooks.append(hook)
 
     def _accumulate_grad(self, name: str, grad: torch.Tensor):
+        # Store accumulator on CPU to avoid filling GPU VRAM across all calibration batches.
+        # For LLaMA-1B this accumulator would otherwise occupy ~4 GB of GPU memory.
+        grad_cpu = grad.abs().cpu()
         if name not in self._grad_accumulator:
-            self._grad_accumulator[name] = torch.zeros(grad.shape, dtype=torch.float32)
-        self._grad_accumulator[name] += grad.abs().cpu().float()
+            self._grad_accumulator[name] = grad_cpu
+        else:
+            self._grad_accumulator[name] += grad_cpu
 
     def remove_hooks(self):
         for hook in self._hooks:
@@ -108,8 +112,8 @@ class GradientSalience:
             logger.warning(f"No gradient found for {param_name}, using magnitude fallback")
             return weight.abs()
 
-        grad = self._grad_accumulator.pop(param_name)  # pop frees ~50-268 MB as salience_map grows
-        return (weight.cpu().abs() * grad).detach()  # multiply on CPU; result stored as .cpu() by caller
+        grad = self._grad_accumulator[param_name].to(weight.device)
+        return (weight.abs() * grad).detach()
 
     def reset(self):
         self._grad_accumulator.clear()
@@ -134,10 +138,13 @@ class HessianSalience:
         """
         for name, param in model.named_parameters():
             if param.grad is not None:
-                grad_sq = param.grad.data.pow(2).cpu().float()
+                # Store on CPU — for LLaMA-1B the Fisher accumulator would otherwise
+                # hold ~4 GB of fp32 tensors on GPU across all calibration batches.
+                grad_sq = param.grad.data.pow(2).cpu()
                 if name not in self._fisher_accumulator:
-                    self._fisher_accumulator[name] = torch.zeros(param.data.shape, dtype=torch.float32)
-                self._fisher_accumulator[name] += grad_sq
+                    self._fisher_accumulator[name] = grad_sq
+                else:
+                    self._fisher_accumulator[name] += grad_sq
         self._n_samples += 1
 
     def compute(self, weight: torch.Tensor, param_name: str) -> torch.Tensor:
@@ -149,8 +156,8 @@ class HessianSalience:
             logger.warning(f"No Fisher info for {param_name}, using magnitude fallback")
             return weight.abs()
 
-        fisher = self._fisher_accumulator.pop(param_name) / self._n_samples  # pop frees entry after use
-        return fisher.detach()  # already on CPU; caller does .cpu() anyway
+        fisher = self._fisher_accumulator[param_name].to(weight.device) / self._n_samples
+        return fisher.detach()
 
     def reset(self):
         self._fisher_accumulator.clear()
