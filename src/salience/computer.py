@@ -130,16 +130,21 @@ class SalienceComputer:
                 if needs_grad:
                     self.model.zero_grad(set_to_none=True)
 
-                # Forward pass — use causal LM loss for gradient signal
+                # Forward pass — use causal LM loss for gradient signal.
+                # Cast loss to float32 before backward: fp16 models produce fp16
+                # loss values which can underflow during backprop (no GradScaler
+                # here), giving zero/NaN gradients and breaking salience scores.
                 outputs = self.model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     labels=input_ids,  # standard causal LM objective
                 )
                 loss = outputs.loss
+                if loss is not None:
+                    loss = loss.float()  # stable backward regardless of model dtype
 
                 if needs_grad and loss is not None:
-                    loss.float().backward()  # cast to float32 to prevent NaN gradients in FP16
+                    loss.backward()
 
                     if "hessian" in self.config.metrics:
                         self.hessian_metric.accumulate(self.model)
@@ -148,10 +153,11 @@ class SalienceComputer:
                     self.model.zero_grad(set_to_none=True)
 
                 # Release output tensors and periodically flush CUDA cache
+                del outputs, loss
+                if batch_idx % 10 == 0 and self.device == "cuda":
+                    torch.cuda.empty_cache()
+
                 n_samples += input_ids.shape[0]
-                del outputs, loss, input_ids
-                if self.device == "cuda":
-                    torch.cuda.empty_cache()  # flush every batch — LLaMA backward = 2.5 GB transient
 
         logger.info(f"Calibration complete ({n_samples} samples processed)")
 
@@ -161,6 +167,8 @@ class SalienceComputer:
         if "activation" in self.config.metrics:
             self.activation_metric.remove_hooks()
 
+        # Flush any unreferenced CUDA tensors before the salience assembly loop.
+        # This recovers GPU memory held by intermediate forward/backward tensors.
         if self.device == "cuda":
             torch.cuda.empty_cache()
 
@@ -195,12 +203,13 @@ class SalienceComputer:
             if "activation" in self.config.metrics:
                 scores["activation"] = self.activation_metric.compute(weight, layer_name)
 
-            # Ensemble combination — store on CPU to free GPU VRAM
+            # Ensemble combination — store on CPU to avoid holding ~4.8 GB on VRAM
+            # for a 1B-param model while the allocator also needs GPU memory.
             if len(scores) == 1:
                 salience_map[param_name] = list(scores.values())[0].cpu()
             else:
                 salience_map[param_name] = self.ensemble.combine(scores).cpu()
-            del scores
+            del scores  # free intermediate per-metric tensors immediately
 
         # Cleanup
         self.gradient_metric.reset()
@@ -228,29 +237,25 @@ class SalienceComputer:
 
     @staticmethod
     def _quantiles(t: torch.Tensor, qs) -> list:
-        """Compute quantiles safely — torch.quantile fails on CUDA for >2^24 elements."""
+        """Compute quantiles on CPU — avoids large randperm allocation on GPU
+        (354M-element randperm for GPT-2 medium needs ~2.8 GB on CUDA)."""
+        t = t.cpu().float()
         MAX = 2 ** 24
         if t.numel() > MAX:
-            idx = torch.randint(0, t.numel(), (MAX,))  # randperm on 1.2B elements = 9.6 GB; randint uses O(sample) memory
+            # randperm(1.2B) would allocate a 9.6 GB int64 tensor — use randint instead,
+            # which only allocates the sample-size tensor (~64 MB for MAX=16M).
+            idx = torch.randint(0, t.numel(), (MAX,))
             t = t[idx]
         return [t.quantile(q).item() for q in qs]
 
     def get_salience_stats(self, salience_map: Dict[str, torch.Tensor]) -> Dict:
-        """Streaming stats: avoids torch.cat on full 3.9 GB salience tensor.
-
-        Uses per-layer accumulators for mean/std and a 4M-element reservoir
-        sample for the global p80 threshold — accurate enough for logging
-        without ever materialising the full flat array.
-        """
+        """Compute summary statistics for logging/visualization."""
         stats = {}
-        RESERVOIR = 2 ** 22  # 4M elements (~16 MB)
-        reservoir_parts = []
-        reservoir_remaining = RESERVOIR
-        g_sum = 0.0; g_sum_sq = 0.0; g_count = 0
+        all_scores = []
 
         for name, scores in salience_map.items():
-            flat = scores.flatten().float().cpu()
-            n = flat.numel()
+            flat = scores.flatten().float().cpu()  # CPU — stats are logging-only
+            all_scores.append(flat)
             p25, p50, p75, p95 = self._quantiles(flat, [0.25, 0.50, 0.75, 0.95])
             stats[name] = {
                 "mean": flat.mean().item(),
@@ -261,29 +266,48 @@ class SalienceComputer:
                 "p50": p50,
                 "p75": p75,
                 "p95": p95,
-                "numel": n,
+                "numel": flat.numel(),
             }
-            g_sum    += flat.sum().item()
-            g_sum_sq += flat.pow(2).sum().item()
-            g_count  += n
-            if reservoir_remaining > 0:
-                take = min(n, reservoir_remaining)
-                idx  = torch.randint(0, n, (take,))
-                reservoir_parts.append(flat[idx].clone())
-                reservoir_remaining -= take
-            del flat
 
-        if g_count > 0:
-            g_mean = g_sum / g_count
-            g_std  = max(g_sum_sq / g_count - g_mean ** 2, 0.0) ** 0.5
-            reservoir = torch.cat(reservoir_parts) if reservoir_parts else torch.tensor([0.0])
-            p80, = self._quantiles(reservoir, [0.80])
-            del reservoir, reservoir_parts
+        if all_scores:
+            global_flat = torch.cat(all_scores)
+            p80, = self._quantiles(global_flat, [0.80])
             stats["_global"] = {
-                "mean": g_mean,
-                "std": g_std,
-                "p80": p80,
-                "total_params": g_count,
+                "mean": global_flat.mean().item(),
+                "std": global_flat.std().item(),
+                "p80": p80,  # 80/20 threshold
+                "total_params": global_flat.numel(),
+            }
+
+        return stats
+ summary statistics for logging/visualization."""
+        stats = {}
+        all_scores = []
+
+        for name, scores in salience_map.items():
+            flat = scores.flatten().float().cpu()  # CPU -- stats are logging-only
+            all_scores.append(flat)
+            p25, p50, p75, p95 = self._quantiles(flat, [0.25, 0.50, 0.75, 0.95])
+            stats[name] = {
+                "mean": flat.mean().item(),
+                "std": flat.std().item(),
+                "min": flat.min().item(),
+                "max": flat.max().item(),
+                "p25": p25,
+                "p50": p50,
+                "p75": p75,
+                "p95": p95,
+                "numel": flat.numel(),
+            }
+
+        if all_scores:
+            global_flat = torch.cat(all_scores)
+            p80, = self._quantiles(global_flat, [0.80])
+            stats["_global"] = {
+                "mean": global_flat.mean().item(),
+                "std": global_flat.std().item(),
+                "p80": p80,  # 80/20 threshold
+                "total_params": global_flat.numel(),
             }
 
         return stats
