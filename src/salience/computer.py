@@ -105,7 +105,7 @@ class SalienceComputer:
 
         # ------- Phase 1: Register hooks -------
         if "gradient" in self.config.metrics:
-            self.gradient_metric.register_hooks(self.model)
+            self.gradient_metric.register_hooks(self.model, target_params=target_params)
 
         if "activation" in self.config.metrics:
             self.activation_metric.register_hooks(self.model)
@@ -147,7 +147,7 @@ class SalienceComputer:
                     loss.backward()
 
                     if "hessian" in self.config.metrics:
-                        self.hessian_metric.accumulate(self.model)
+                        self.hessian_metric.accumulate(self.model, target_params=target_params)
 
                     # Free gradient tensors immediately after accumulation
                     self.model.zero_grad(set_to_none=True)
@@ -240,10 +240,8 @@ class SalienceComputer:
         """Compute quantiles on CPU — avoids large randperm allocation on GPU
         (354M-element randperm for GPT-2 medium needs ~2.8 GB on CUDA)."""
         t = t.cpu().float()
-        MAX = 2 ** 24
+        MAX = 500_000  # 500K samples: good quantile accuracy, ~32x faster than 16M
         if t.numel() > MAX:
-            # randperm(1.2B) would allocate a 9.6 GB int64 tensor — use randint instead,
-            # which only allocates the sample-size tensor (~64 MB for MAX=16M).
             idx = torch.randint(0, t.numel(), (MAX,))
             t = t[idx]
         return [t.quantile(q).item() for q in qs]

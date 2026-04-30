@@ -308,9 +308,10 @@ def _get_ablation_configs(ablation_type: str) -> Dict[str, QuantizerConfig]:
                 salience=sal_config,
                 allocation=AllocationConfig(target_avg_bits=1.61),
             )
-        # Also test ensemble
+        # Also test ensemble (hessian excluded: too memory-intensive for T4 —
+        # combined gradient+hessian accumulators = ~10 GB CPU, near T4 limit)
         configs["combined"] = QuantizerConfig(
-            salience=SalienceConfig(metrics=["magnitude_l1", "magnitude_l2", "gradient", "hessian", "activation"]),
+            salience=SalienceConfig(metrics=["magnitude_l1", "magnitude_l2", "gradient", "activation"]),
             allocation=AllocationConfig(target_avg_bits=1.61),
         )
 

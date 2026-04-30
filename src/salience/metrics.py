@@ -80,9 +80,17 @@ class GradientSalience:
         self._grad_accumulator: Dict[str, torch.Tensor] = {}
         self._hooks = []
 
-    def register_hooks(self, model: nn.Module):
-        """Register backward hooks to capture gradients."""
+    def register_hooks(self, model: nn.Module, target_params=None):
+        """Register backward hooks to capture gradients.
+
+        target_params: if set, only hook these param names (saves CPU RAM).
+        For LLaMA-1B hooking ALL 1.24B params gives a 4.96 GB fp32 accumulator;
+        limiting to the 112 quantizable targets cuts it to 3.9 GB.
+        """
+        target_set = set(target_params) if target_params is not None else None
         for name, param in model.named_parameters():
+            if target_set is not None and name not in target_set:
+                continue
             if param.requires_grad:
                 hook = param.register_hook(
                     lambda grad, n=name: self._accumulate_grad(n, grad)
@@ -131,12 +139,18 @@ class HessianSalience:
         self._fisher_accumulator: Dict[str, torch.Tensor] = {}
         self._n_samples = 0
 
-    def accumulate(self, model: nn.Module):
+    def accumulate(self, model: nn.Module, target_params=None):
         """
         Call after each backward pass to accumulate Fisher diagonal.
-        Must call model.zero_grad() before each forward pass.
+
+        target_params: if set, only accumulate for these param names.
+        For LLaMA-1B accumulating ALL 1.24B params = 4.96 GB fp32 CPU;
+        limiting to 112 quantizable targets = 3.9 GB.
         """
+        target_set = set(target_params) if target_params is not None else None
         for name, param in model.named_parameters():
+            if target_set is not None and name not in target_set:
+                continue
             if param.grad is not None:
                 # Store on CPU — for LLaMA-1B the Fisher accumulator would otherwise
                 # hold ~4 GB of fp32 tensors on GPU across all calibration batches.
