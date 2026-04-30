@@ -18,7 +18,6 @@ from typing import Dict, Optional, Tuple
 from dataclasses import dataclass, field
 from tqdm import tqdm
 import logging
-import gc
 import time
 import json
 import os
@@ -122,6 +121,9 @@ class SalientMaskQuantizer:
         self.timing["phase1_salience"] = time.time() - t0
         logger.info(f"Phase 1 complete in {self.timing['phase1_salience']:.1f}s")
 
+        # Flush CUDA cache after salience computation — gradients/activations held
+        # during calibration may not be GC'd yet; this recovers that VRAM before
+        # Phase 2 (allocation) and Phase 3 (quantization) run.
         if self.device == "cuda":
             torch.cuda.empty_cache()
 
@@ -133,12 +135,8 @@ class SalientMaskQuantizer:
                         f"p80={g['p80']:.4f}, total_params={g['total_params']:,}")
 
         # ---- Phase 2: Bit allocation ----
-        gc.collect()  # free Phase 1 temporaries before allocation
         logger.info("\n[Phase 2] Greedy bit allocation...")
         t0 = time.time()
-        if self.device == "cuda":
-            gc.collect()
-            torch.cuda.empty_cache()
         self.bit_map = self.bit_allocator.allocate(self.salience_map)
         self.timing["phase2_allocation"] = time.time() - t0
 
@@ -239,7 +237,9 @@ class SalientMaskQuantizer:
             if param is None:
                 continue
 
-            original_weight = param.data.float().clone()  # upcast to float32 for quantization precision
+            # Work in fp32 for numerical precision — param may be fp16 if the
+            # model was loaded with torch_dtype=float16.
+            original_weight = param.data.float().clone()
             bit_tensor = self.bit_map[param_name]
 
             # Check if all weights have same bit width (fast path)
@@ -259,41 +259,105 @@ class SalientMaskQuantizer:
                 self.quantization_meta[param_name] = meta
 
             else:
-                # Mixed-precision within this layer — processed row-by-row.
-                #
-                # KEY FIX: the original code used a boolean mask to extract
-                # weights of each bit-level into a flat 1-D array spanning
-                # multiple rows. Block boundaries therefore crossed unrelated
-                # rows, corrupting the per-block scale statistics and causing
-                # perplexity to jump from 541 to 12,173 (22x degradation).
-                #
-                # By iterating over each row independently, every block is
-                # guaranteed to contain only spatially coherent weights from
-                # the same output neuron, giving accurate block scales.
-                deq_weight = torch.empty_like(original_weight)
+                # Mixed-precision within this layer.
+                # Process row-by-row so that block-wise scales are computed from
+                # contiguous, spatially-coherent weight groups rather than from
+                # randomly scattered positions across the full weight matrix.
+                # (The old approach used boolean masking which interleaved weights
+                # from unrelated rows into the same quantization block, producing
+                # corrupted scale statistics.)
+                deq_weight = original_weight.clone()  # default: keep original
 
-                for row_idx in range(original_weight.shape[0]):
-                    row_weights = original_weight[row_idx]   # [in_features]
-                    row_bits    = bit_tensor[row_idx]         # [in_features]
+                if original_weight.dim() == 2:
+                    for row_idx in range(original_weight.shape[0]):
+                        row_bits = bit_tensor[row_idx]       # [in_features]
+                        row_w    = original_weight[row_idx]  # [in_features]
+                        row_deq  = deq_weight[row_idx]
 
-                    for bits in sorted({int(b) for b in row_bits.unique().tolist()}):
-                        mask = (row_bits == bits)
+                        for bits in [int(b) for b in unique_bits]:
+                            col_mask = (row_bits == bits)
+                            if not col_mask.any():
+                                continue
+                            group = row_w[col_mask].unsqueeze(0)  # [1, n_selected]
+                            group_deq, meta = quantize_weight(
+                                group,
+                                bits=bits,
+                                scheme=self.config.scheme_2bit,
+                                block_size=min(self.config.block_size, group.numel()),
+                                refine_scales=self.config.refine_scales,
+                            )
+                            row_deq[col_mask] = group_deq.reshape(-1).to(row_deq.dtype)
+                else:
+                    # Fallback for non-2D weights: original flattened approach
+                    for bits in [int(b) for b in unique_bits]:
+                        mask = (bit_tensor == bits)
                         if not mask.any():
                             continue
-                        group = row_weights[mask]              # contiguous 1-D slice
-                        group_deq, _ = quantize_weight(
-                            group.unsqueeze(0),
+                        group_flat = original_weight[mask]
+                        group_deq, meta = quantize_weight(
+                            group_flat.unsqueeze(0),
                             bits=bits,
                             scheme=self.config.scheme_2bit,
                             block_size=self.config.block_size,
                             refine_scales=self.config.refine_scales,
                         )
-                        deq_weight[row_idx][mask] = group_deq.reshape(-1).to(deq_weight.dtype)
+                        deq_weight[mask] = group_deq.reshape(-1).to(deq_weight.dtype)
 
+                # Fill unquantized positions (shouldn't exist, but safety)
                 param.data.copy_(deq_weight.to(param.data.dtype))
                 self.quantization_meta[param_name] = {"bits": "mixed", "unique_bits": unique_bits}
 
             # Track reconstruction error
+            error = (original_weight - param.data.float()).pow(2).mean().item()
+            total_error += error
+            n_quantized += 1
+
+        avg_error = total_error / n_quantized if n_quantized > 0 else 0
+        logger.info(f"Quantized {n_quantized} tensors, avg L2 reconstruction error: {avg_error:.6f}")
+
+    def save_results(self, output_dir: str):
+        """Save bit map, salience stats, and timing to disk."""
+        os.makedirs(output_dir, exist_ok=True)
+
+        if self.bit_map and self.config.save_bit_map:
+            torch.save(self.bit_map, os.path.join(output_dir, "bit_map.pt"))
+            logger.info(f"Saved bit map to {output_dir}/bit_map.pt")
+
+        if self.salience_map and self.config.save_salience_map:
+            torch.save(self.salience_map, os.path.join(output_dir, "salience_map.pt"))
+
+        # Save allocation stats as JSON
+        if self.bit_map:
+            stats = self.bit_allocator.get_allocation_stats(self.bit_map)
+            with open(os.path.join(output_dir, "allocation_stats.json"), "w") as f:
+                json.dump(stats, f, indent=2)
+
+        # Save timing
+        with open(os.path.join(output_dir, "timing.json"), "w") as f:
+            json.dump(self.timing, f, indent=2)
+
+        logger.info(f"Results saved to {output_dir}")
+
+    def get_memory_footprint(self) -> Dict:
+        """Estimate memory savings from quantization."""
+        if self.bit_map is None:
+            return {}
+
+        fp16_bits = 0
+        quant_bits = 0
+
+        for name, bits_tensor in self.bit_map.items():
+            n = bits_tensor.numel()
+            fp16_bits += n * 16
+            quant_bits += bits_tensor.float().sum().item()
+
+        return {
+            "fp16_gb": fp16_bits / 8 / 1e9,
+            "quantized_gb": quant_bits / 8 / 1e9,
+            "compression_ratio": fp16_bits / quant_bits if quant_bits > 0 else 0,
+            "avg_bits": quant_bits / (fp16_bits / 16) if fp16_bits > 0 else 0,
+        }
+
             error = (original_weight - param.data.float()).pow(2).mean().item()
             total_error += error
             n_quantized += 1
