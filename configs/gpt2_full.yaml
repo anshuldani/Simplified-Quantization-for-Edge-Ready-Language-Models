@@ -14,9 +14,9 @@ calibration_batch_size: 4
 # Our method
 target_avg_bits: 1.61
 granularity: weight
-quant_scheme: asymmetric
+block_size: 32            # smaller blocks = more scales = better PPL (was 128)
+quant_scheme: asymmetric  # uses full [min,max] range, better for skewed dists
 refine_scales: true
-block_size: 32               # finer blocks; 128→32 cuts PPL by ~3x at same bit budget
 salience_metrics:
   - magnitude_l1
   - magnitude_l2
@@ -37,7 +37,7 @@ run:
   - ours
   - ablations
 
-run_gptq: false              # GPTQ baseline disabled (flaky auto-gptq install on T4)
+run_gptq: false              # skip GPTQ — auto-gptq install is flaky on Colab T4
 
 # Ablation study 1 (Milestone B)
 ablation_types:
