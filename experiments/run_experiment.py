@@ -60,13 +60,21 @@ def load_model_and_tokenizer(model_name: str, device: str = "cuda"):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Load on CPU first (low_cpu_mem_usage avoids double-memory during load),
-    # then move to device explicitly. Avoids accelerate's device_map memory
-    # estimator which can fall back to CPU offloading after fragmented runs.
+    # Use fp16 on CUDA to halve weight memory (~2 GB saved for LLaMA-1B on T4).
+    # Quantization maths are still precise because we operate on .float() clones
+    # inside quantize_weight(); the stored param dtype stays fp16 throughout.
+    #
+    # CRITICAL: do NOT use device_map="auto" or low_cpu_mem_usage=True.
+    # device_map="auto" installs accelerate CPU-offload hooks which cause:
+    #   - "Materializing param" spam during calibration
+    #   - Gradient backward running on CPU → 9 s/it instead of <0.5 s/it
+    #   - Exit -9 (CPU OOM) at the first gradient batch
+    # Load plainly and call .to(device) — this guarantees every param lands on
+    # CUDA with no hooks attached.
+    load_dtype = torch.float16 if "cuda" in device else torch.float32
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.float16,
-        low_cpu_mem_usage=True,
+        torch_dtype=load_dtype,
         trust_remote_code=True,
     )
     model = model.to(device)
@@ -120,7 +128,11 @@ def run_baseline_experiments(
         results["avg_bits"] = baseline.avg_bits()
 
         tracker.add_result(baseline_name, results)
+        with torch.no_grad():
+            for param in base_model.parameters():
+                param.data = param.data.new_empty(0)
         del quantized, base_model, evaluator, results
+        torch.cuda.synchronize()
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -257,12 +269,11 @@ def run_ablation_study(
         }
         logger.info(f"    PPL: {ppl:.2f}, avg bits: {results['avg_bits']:.3f}")
 
-        # Free GPU memory in-place — no CPU transfer needed (avoids
-        # 2.5 GB CPU RAM spike from .cpu() when RAM is near limit)
+        # Free weights in-place before del — avoids a 2.5 GB CPU spike that
+        # .cpu() / Python GC would otherwise cause on a nearly-full T4.
         with torch.no_grad():
             for param in base_model.parameters():
                 param.data = param.data.new_empty(0)
-        # Free quantizer large tensors explicitly before Python GC
         if hasattr(quantizer, "bit_map"):
             quantizer.bit_map = None
         if hasattr(quantizer, "salience_map"):
