@@ -358,13 +358,6 @@ class SalientMaskQuantizer:
             "avg_bits": quant_bits / (fp16_bits / 16) if fp16_bits > 0 else 0,
         }
 
-            error = (original_weight - param.data.float()).pow(2).mean().item()
-            total_error += error
-            n_quantized += 1
-
-        avg_error = total_error / n_quantized if n_quantized > 0 else 0
-        logger.info(f"Quantized {n_quantized} tensors, avg L2 reconstruction error: {avg_error:.6f}")
-
     def save_results(self, output_dir: str):
         """Save bit map, salience stats, and timing to disk."""
         os.makedirs(output_dir, exist_ok=True)

@@ -280,34 +280,3 @@ class SalienceComputer:
             }
 
         return stats
- summary statistics for logging/visualization."""
-        stats = {}
-        all_scores = []
-
-        for name, scores in salience_map.items():
-            flat = scores.flatten().float().cpu()  # CPU -- stats are logging-only
-            all_scores.append(flat)
-            p25, p50, p75, p95 = self._quantiles(flat, [0.25, 0.50, 0.75, 0.95])
-            stats[name] = {
-                "mean": flat.mean().item(),
-                "std": flat.std().item(),
-                "min": flat.min().item(),
-                "max": flat.max().item(),
-                "p25": p25,
-                "p50": p50,
-                "p75": p75,
-                "p95": p95,
-                "numel": flat.numel(),
-            }
-
-        if all_scores:
-            global_flat = torch.cat(all_scores)
-            p80, = self._quantiles(global_flat, [0.80])
-            stats["_global"] = {
-                "mean": global_flat.mean().item(),
-                "std": global_flat.std().item(),
-                "p80": p80,  # 80/20 threshold
-                "total_params": global_flat.numel(),
-            }
-
-        return stats

@@ -351,33 +351,3 @@ class BitAllocator:
         }
 
         return stats
- n
-            layer_bits = flat.float().sum().item()
-            total_bits += layer_bits
-
-            layer_dist = {}
-            for b in self.config.bit_choices:
-                count = (flat == b).sum().item()
-                layer_dist[f"{b}bit"] = count
-                bit_dist[b] += count
-
-            stats[name] = {
-                "avg_bits": layer_bits / n,
-                "n_params": n,
-                **layer_dist,
-            }
-
-        stats["_summary"] = {
-            "total_params": total_params,
-            "avg_bits": total_bits / total_params if total_params > 0 else 0,
-            "target_bits": self.config.target_avg_bits,
-            "bit_distribution": {
-                f"{b}bit": {
-                    "count": bit_dist[b],
-                    "pct": 100.0 * bit_dist[b] / total_params if total_params > 0 else 0
-                }
-                for b in self.config.bit_choices
-            }
-        }
-
-        return stats
