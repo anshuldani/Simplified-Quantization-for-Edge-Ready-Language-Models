@@ -85,78 +85,91 @@ class BitAllocator:
         self,
         salience_map: Dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
-        """Per-element allocation via global threshold estimation + layer-by-layer apply.
-
-        Avoids two catastrophic memory events in the original implementation:
-          1. torch.cat of all salience tensors into a 3.9 GB flat array (+ copy = 7.8 GB peak)
-          2. torch.topk on that array allocates another 3.9 GB index tensor
-
-        Instead:
-          - Step 1: reservoir sample up to 50M elements (one layer at a time, ~200 MB)
-          - Step 2: derive per-level thresholds from the sorted sample
-          - Step 3: apply thresholds row-by-row; peak extra RAM ~50 MB at any point
         """
+        Per-element bit allocation using vectorized torch operations.
+
+        Replaces the previous O(n²) Python-loop approach (which built a list of
+        85M tuples and sorted them in pure Python) with:
+          1. torch.cat  — flatten all salience scores in one shot
+          2. torch.topk — find the top-k weights to upgrade (C++ kernel, O(n log k))
+          3. index assignment — apply upgrades in a single tensor op
+        """
+        logger.info("Weight-wise allocation: flattening salience scores...")
+
         names = list(salience_map.keys())
-        total_params = sum(salience_map[n].numel() for n in names)
+        # Always work on CPU: for a 1B-param model, keeping all_scores on GPU
+        # consumes ~4.8 GB VRAM and topk(700M) adds another ~8 GB of index tensors.
+        flat_parts = [salience_map[n].float().cpu().flatten() for n in names]
+        sizes = [p.numel() for p in flat_parts]
+        offsets = [0] + list(np.cumsum(sizes))
+
+        all_scores = torch.cat(flat_parts)          # [total_params] on CPU
+        total_params = all_scores.numel()
+
         min_bits = min(self.config.bit_choices)
+        target_total_bits = self.config.target_avg_bits * total_params
+        current_total_bits = float(min_bits * total_params)
 
-        logger.info(f"Weight-wise allocation: {total_params:,} params, "
-                    f"target {self.config.target_avg_bits} avg bits")
+        logger.info(f"Total params: {total_params:,}")
+        logger.info(f"Target avg bits: {self.config.target_avg_bits:.3f} "
+                    f"({target_total_bits:.0f} total bits)")
+        logger.info(f"Starting at {min_bits}-bit ({current_total_bits:.0f} bits)")
 
-        # ── Step 1: reservoir sampling (one layer at a time) ──────────────────
-        # Peak extra memory: ~200 MB for the reservoir; no full 3.9 GB flat array.
-        logger.info("  Step 1: sampling global salience distribution...")
-        RESERVOIR_N = 50_000_000   # 50M float32 = ~200 MB; accurate to <0.1% quantile error
-        sample_per = max(100, RESERVOIR_N // len(names))
-        parts = []
-        for n in names:
-            f   = salience_map[n].float().cpu().flatten()
-            idx = torch.randint(0, f.numel(), (min(f.numel(), sample_per),))
-            parts.append(f[idx].clone())
-            del f, idx
-        sample = torch.cat(parts)[:RESERVOIR_N]
-        del parts
-        sample_sorted, _ = sample.sort(descending=True)
-        del sample
-        n_samp = len(sample_sorted)
-
-        # ── Step 2: derive per-level thresholds from sorted sample ────────────
-        thresholds: Dict[int, float] = {}
-        remaining_budget = (self.config.target_avg_bits - min_bits) * total_params
+        bits_flat = torch.full((total_params,), min_bits, dtype=torch.uint8)  # CPU
 
         for target_bits in sorted(set(self.config.bit_choices) - {min_bits}):
-            gain = target_bits - min_bits
-            k    = min(int(remaining_budget / gain), total_params)
-            if k <= 0:
+            budget = target_total_bits - current_total_bits
+            if budget <= 0:
+                logger.info(f"Budget exhausted before {target_bits}-bit upgrades")
                 break
-            cutoff = min(int(k / total_params * n_samp), n_samp - 1)
-            thresholds[target_bits] = float(sample_sorted[cutoff])
-            remaining_budget -= k * gain
-            logger.info(f"    {target_bits}-bit threshold: {thresholds[target_bits]:.6f} "
-                        f"(~{k / 1e6:.1f}M weights, {100 * k / total_params:.1f}%)")
-        del sample_sorted
 
-        # ── Step 3: apply thresholds layer by layer ───────────────────────────
-        logger.info("  Step 2: applying thresholds layer by layer...")
+            gain = target_bits - min_bits
+            max_upgrades = int(budget / gain)
+            if max_upgrades == 0:
+                continue
+
+            upgradeable = (bits_flat == min_bits)
+            n_upgradeable = int(upgradeable.sum().item())
+            k = min(max_upgrades, n_upgradeable)
+
+            logger.info(f"Upgrading up to {k:,} weights to {target_bits}-bit "
+                        f"(budget: {budget:.0f} bits)")
+
+            if k == 0:
+                break
+
+            # Threshold-based upgrade: avoids topk(700M) which allocates ~8 GB of
+            # index tensors.  Instead, sample the upgradeable scores to find the
+            # kth-largest threshold value, then apply a boolean mask (O(n), ~1 GB).
+            SAMPLE_N = min(10_000_000, n_upgradeable)
+            upgradeable_idx = upgradeable.nonzero(as_tuple=True)[0]
+            sample_idx = upgradeable_idx[torch.randint(0, n_upgradeable, (SAMPLE_N,))]
+            sample_scores = all_scores[sample_idx]
+            del upgradeable_idx, sample_idx
+
+            # Estimate the threshold: top-k in sample maps to top-(k/n_upgradeable)
+            # fraction of the population.
+            k_in_sample = max(1, min(int(k * SAMPLE_N / n_upgradeable), SAMPLE_N - 1))
+            # kthvalue returns kth *smallest*, so rank from end for largest
+            threshold = sample_scores.kthvalue(SAMPLE_N - k_in_sample + 1).values.item()
+            del sample_scores
+
+            upgrade_mask = upgradeable & (all_scores >= threshold)
+            actual_upgrades = int(upgrade_mask.sum().item())
+            bits_flat[upgrade_mask] = target_bits
+            current_total_bits += actual_upgrades * gain
+
+            logger.info(f"Upgraded {actual_upgrades:,} weights to {target_bits}-bit "
+                        f"(avg: {current_total_bits / total_params:.4f})")
+
+        logger.info(f"Final avg bits: {current_total_bits / total_params:.4f} "
+                    f"(target: {self.config.target_avg_bits})")
+
+        # Reshape back into per-param tensors
         bit_map: Dict[str, torch.Tensor] = {}
-        counts = {b: 0 for b in self.config.bit_choices}
-
-        for n in names:
-            f  = salience_map[n].float().cpu().flatten()
-            lb = torch.full((f.numel(),), min_bits, dtype=torch.uint8)
-            for tb in sorted(thresholds, reverse=True):   # highest bits first
-                mask = (lb == min_bits) & (f >= thresholds[tb])
-                lb[mask] = tb
-                del mask
-            bit_map[n] = lb.reshape(salience_map[n].shape)
-            for b in self.config.bit_choices:
-                counts[b] += int((lb == b).sum().item())
-            del f, lb
-
-        avg = sum(b * counts[b] for b in self.config.bit_choices) / total_params
-        logger.info(f"Final avg bits: {avg:.4f} (target: {self.config.target_avg_bits})")
-        for b in self.config.bit_choices:
-            logger.info(f"  {b}bit: {counts[b]:,} ({100 * counts[b] / total_params:.1f}%)")
+        for i, name in enumerate(names):
+            start, end = offsets[i], offsets[i + 1]
+            bit_map[name] = bits_flat[start:end].reshape(salience_map[name].shape)
 
         return bit_map
 
@@ -309,6 +322,36 @@ class BitAllocator:
             flat = bits.flatten()
             n = flat.numel()
             total_params += n
+            layer_bits = flat.float().sum().item()
+            total_bits += layer_bits
+
+            layer_dist = {}
+            for b in self.config.bit_choices:
+                count = (flat == b).sum().item()
+                layer_dist[f"{b}bit"] = count
+                bit_dist[b] += count
+
+            stats[name] = {
+                "avg_bits": layer_bits / n,
+                "n_params": n,
+                **layer_dist,
+            }
+
+        stats["_summary"] = {
+            "total_params": total_params,
+            "avg_bits": total_bits / total_params if total_params > 0 else 0,
+            "target_bits": self.config.target_avg_bits,
+            "bit_distribution": {
+                f"{b}bit": {
+                    "count": bit_dist[b],
+                    "pct": 100.0 * bit_dist[b] / total_params if total_params > 0 else 0
+                }
+                for b in self.config.bit_choices
+            }
+        }
+
+        return stats
+ n
             layer_bits = flat.float().sum().item()
             total_bits += layer_bits
 
