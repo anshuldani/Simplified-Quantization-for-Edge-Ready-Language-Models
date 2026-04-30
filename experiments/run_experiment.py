@@ -60,15 +60,16 @@ def load_model_and_tokenizer(model_name: str, device: str = "cuda"):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # Load on CPU first (low_cpu_mem_usage avoids double-memory during load),
+    # then move to device explicitly. Avoids accelerate's device_map memory
+    # estimator which can fall back to CPU offloading after fragmented runs.
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.float16,   # FP16 loading saves ~2 GB VRAM on T4; kernels upcast internally
-        device_map={"": device} if device == "cuda" else None,  # force all layers onto GPU 0
+        torch_dtype=torch.float16,
+        low_cpu_mem_usage=True,
         trust_remote_code=True,
     )
-
-    if device != "cuda":
-        model = model.to(device)
+    model = model.to(device)
 
     model.eval()
 
@@ -256,6 +257,7 @@ def run_ablation_study(
         }
         logger.info(f"    PPL: {ppl:.2f}, avg bits: {results['avg_bits']:.3f}")
 
+        base_model.cpu()  # force weights off GPU before del
         del base_model, quantizer, evaluator, results
         gc.collect()
         torch.cuda.empty_cache()
