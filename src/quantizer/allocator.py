@@ -11,7 +11,7 @@ Given:
 Algorithm:
   1. Start all weights at 1-bit (baseline)
   2. Sort weights by salience score (descending)
-  3. Greedily upgrade 1→2→4 bits while avg_bits ≤ target
+  3. Greedily upgrade 1->2->4 bits while avg_bits <= target
   4. Return bit_map: {param_name -> bit_tensor (same shape as param)}
 
 Two granularity modes:
@@ -48,7 +48,7 @@ class BitAllocator:
     Greedy bit allocator that respects a global average-bits budget.
 
     The core insight: sort ALL weights globally by salience, then upgrade
-    the most salient weights first from 1-bit → 2-bit → 4-bit until
+    the most salient weights first from 1-bit -> 2-bit -> 4-bit until
     the budget is exhausted.
     """
 
@@ -86,25 +86,24 @@ class BitAllocator:
         salience_map: Dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
         """
-        Per-element bit allocation using vectorized torch operations.
+        Per-element bit allocation using layer-by-layer reservoir sampling.
 
-        Replaces the previous O(n²) Python-loop approach (which built a list of
-        85M tuples and sorted them in pure Python) with:
-          1. torch.cat  — flatten all salience scores in one shot
-          2. torch.topk — find the top-k weights to upgrade (C++ kernel, O(n log k))
-          3. index assignment — apply upgrades in a single tensor op
+        Previous approach: torch.cat of all 973M salience scores -> 3.9 GB copy
+        on top of the 3.9 GB salience_map already in RAM = 7.8 GB peak -> OOM.
+
+        New approach:
+          1. Reservoir sample up to RESERVOIR_N scores per round (16 MB)
+             to estimate the global kth-largest threshold - no global cat needed.
+          2. Apply threshold layer-by-layer with a boolean mask.
+
+        Peak extra RAM: RESERVOIR_N * 4 bytes = 16 MB (vs 3.9 GB before).
         """
-        logger.info("Weight-wise allocation: flattening salience scores...")
+        RESERVOIR_N = 4_000_000   # 4M floats = 16 MB
+
+        logger.info("Weight-wise allocation: layer-by-layer reservoir sampling...")
 
         names = list(salience_map.keys())
-        # Always work on CPU: for a 1B-param model, keeping all_scores on GPU
-        # consumes ~4.8 GB VRAM and topk(700M) adds another ~8 GB of index tensors.
-        flat_parts = [salience_map[n].float().cpu().flatten() for n in names]
-        sizes = [p.numel() for p in flat_parts]
-        offsets = [0] + list(np.cumsum(sizes))
-
-        all_scores = torch.cat(flat_parts)          # [total_params] on CPU
-        total_params = all_scores.numel()
+        total_params = sum(salience_map[n].numel() for n in names)
 
         min_bits = min(self.config.bit_choices)
         target_total_bits = self.config.target_avg_bits * total_params
@@ -115,7 +114,11 @@ class BitAllocator:
                     f"({target_total_bits:.0f} total bits)")
         logger.info(f"Starting at {min_bits}-bit ({current_total_bits:.0f} bits)")
 
-        bits_flat = torch.full((total_params,), min_bits, dtype=torch.uint8)  # CPU
+        # Initialise all weights at min_bits, one tensor per layer (no global flat)
+        bit_map: Dict[str, torch.Tensor] = {
+            name: torch.full(salience_map[name].shape, min_bits, dtype=torch.uint8)
+            for name in names
+        }
 
         for target_bits in sorted(set(self.config.bit_choices) - {min_bits}):
             budget = target_total_bits - current_total_bits
@@ -128,48 +131,55 @@ class BitAllocator:
             if max_upgrades == 0:
                 continue
 
-            upgradeable = (bits_flat == min_bits)
-            n_upgradeable = int(upgradeable.sum().item())
-            k = min(max_upgrades, n_upgradeable)
+            # ---- Pass 1: reservoir sample to estimate the global threshold ----
+            reservoir: List[torch.Tensor] = []
+            n_upgradeable = 0
+            samples_per_layer = max(1, RESERVOIR_N // len(names))
 
-            logger.info(f"Upgrading up to {k:,} weights to {target_bits}-bit "
-                        f"(budget: {budget:.0f} bits)")
+            for name in names:
+                sal = salience_map[name].float().cpu().flatten()
+                up_mask = (bit_map[name].flatten() == min_bits)
+                up_scores = sal[up_mask]
+                n = up_scores.numel()
+                n_upgradeable += n
+                if n > 0:
+                    s = min(samples_per_layer, n)
+                    idx = torch.randint(0, n, (s,))
+                    reservoir.append(up_scores[idx])
+                del sal, up_mask, up_scores
 
-            if k == 0:
+            if n_upgradeable == 0:
                 break
 
-            # Threshold-based upgrade: avoids topk(700M) which allocates ~8 GB of
-            # index tensors.  Instead, sample the upgradeable scores to find the
-            # kth-largest threshold value, then apply a boolean mask (O(n), ~1 GB).
-            SAMPLE_N = min(10_000_000, n_upgradeable)
-            upgradeable_idx = upgradeable.nonzero(as_tuple=True)[0]
-            sample_idx = upgradeable_idx[torch.randint(0, n_upgradeable, (SAMPLE_N,))]
-            sample_scores = all_scores[sample_idx]
-            del upgradeable_idx, sample_idx
+            k = min(max_upgrades, n_upgradeable)
+            logger.info(f"Upgrading up to {k:,} weights to {target_bits}-bit "
+                        f"(budget: {budget:.0f} bits, upgradeable: {n_upgradeable:,})")
 
-            # Estimate the threshold: top-k in sample maps to top-(k/n_upgradeable)
-            # fraction of the population.
-            k_in_sample = max(1, min(int(k * SAMPLE_N / n_upgradeable), SAMPLE_N - 1))
-            # kthvalue returns kth *smallest*, so rank from end for largest
-            threshold = sample_scores.kthvalue(SAMPLE_N - k_in_sample + 1).values.item()
-            del sample_scores
+            res_cat = torch.cat(reservoir)
+            del reservoir
+            res_n = res_cat.numel()
+            k_in_res = max(1, min(int(k * res_n / n_upgradeable), res_n - 1))
+            # kthvalue returns the kth *smallest* -- invert to get kth largest
+            threshold = res_cat.kthvalue(res_n - k_in_res + 1).values.item()
+            del res_cat
 
-            upgrade_mask = upgradeable & (all_scores >= threshold)
-            actual_upgrades = int(upgrade_mask.sum().item())
-            bits_flat[upgrade_mask] = target_bits
+            # ---- Pass 2: apply threshold layer by layer ----
+            actual_upgrades = 0
+            for name in names:
+                sal = salience_map[name].float().cpu().flatten()
+                bits = bit_map[name].flatten()
+                up_mask = (bits == min_bits) & (sal >= threshold)
+                bits[up_mask] = target_bits
+                bit_map[name] = bits.reshape(salience_map[name].shape)
+                actual_upgrades += int(up_mask.sum().item())
+                del sal, bits, up_mask
+
             current_total_bits += actual_upgrades * gain
-
-            logger.info(f"Upgraded {actual_upgrades:,} weights to {target_bits}-bit "
+            logger.info(f"  -> upgraded {actual_upgrades:,} weights "
                         f"(avg: {current_total_bits / total_params:.4f})")
 
         logger.info(f"Final avg bits: {current_total_bits / total_params:.4f} "
                     f"(target: {self.config.target_avg_bits})")
-
-        # Reshape back into per-param tensors
-        bit_map: Dict[str, torch.Tensor] = {}
-        for i, name in enumerate(names):
-            start, end = offsets[i], offsets[i + 1]
-            bit_map[name] = bits_flat[start:end].reshape(salience_map[name].shape)
 
         return bit_map
 
