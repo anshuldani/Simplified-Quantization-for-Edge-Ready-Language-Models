@@ -249,34 +249,67 @@ class SalienceComputer:
         return [t.quantile(q).item() for q in qs]
 
     def get_salience_stats(self, salience_map: Dict[str, torch.Tensor]) -> Dict:
-        """Compute summary statistics for logging/visualization."""
+        """Compute summary statistics for logging/visualization.
+
+        Streaming implementation — never materialises a global concat of the
+        salience map.  For LLaMA-1B that would be another 3.9 GB allocation
+        (on top of the 3.9 GB salience_map already in RAM) -> OOM.
+
+        Instead:
+          - Per-layer stats computed one tensor at a time, deleted immediately.
+          - Global mean/std via running sum (no extra RAM).
+          - Global p80 via reservoir sampling (RESERVOIR_N * 4 bytes = 8 MB).
+        """
+        RESERVOIR_N = 2_000_000   # 8 MB reservoir for p80 estimation
+
         stats = {}
-        all_scores = []
+        global_sum = 0.0
+        global_sum_sq = 0.0
+        global_n = 0
+        reservoir = []
+        n_layers = max(1, len(salience_map))
+        samples_per_layer = max(1, RESERVOIR_N // n_layers)
 
         for name, scores in salience_map.items():
-            flat = scores.flatten().float().cpu()  # CPU — stats are logging-only
-            all_scores.append(flat)
+            flat = scores.flatten().float().cpu()   # view if already float32 CPU
+            n = flat.numel()
+
             p25, p50, p75, p95 = self._quantiles(flat, [0.25, 0.50, 0.75, 0.95])
             stats[name] = {
                 "mean": flat.mean().item(),
-                "std": flat.std().item(),
-                "min": flat.min().item(),
-                "max": flat.max().item(),
-                "p25": p25,
-                "p50": p50,
-                "p75": p75,
-                "p95": p95,
-                "numel": flat.numel(),
+                "std":  flat.std().item(),
+                "min":  flat.min().item(),
+                "max":  flat.max().item(),
+                "p25": p25, "p50": p50, "p75": p75, "p95": p95,
+                "numel": n,
             }
 
-        if all_scores:
-            global_flat = torch.cat(all_scores)
-            p80, = self._quantiles(global_flat, [0.80])
+            # Accumulate for global mean/std
+            global_sum    += flat.sum().item()
+            global_sum_sq += flat.pow(2).sum().item()
+            global_n      += n
+
+            # Reservoir sample for p80
+            s   = min(samples_per_layer, n)
+            idx = torch.randint(0, n, (s,))
+            reservoir.append(flat[idx].clone())   # clone: flat may be a view
+            del flat
+
+        if global_n > 0:
+            global_mean = global_sum / global_n
+            global_var  = max(0.0, global_sum_sq / global_n - global_mean ** 2)
+            global_std  = global_var ** 0.5
+
+            res_cat = torch.cat(reservoir)
+            del reservoir
+            p80, = self._quantiles(res_cat, [0.80])
+            del res_cat
+
             stats["_global"] = {
-                "mean": global_flat.mean().item(),
-                "std": global_flat.std().item(),
-                "p80": p80,  # 80/20 threshold
-                "total_params": global_flat.numel(),
+                "mean":         global_mean,
+                "std":          global_std,
+                "p80":          p80,
+                "total_params": global_n,
             }
 
         return stats
