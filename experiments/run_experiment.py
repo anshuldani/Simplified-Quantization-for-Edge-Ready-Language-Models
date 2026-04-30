@@ -257,8 +257,18 @@ def run_ablation_study(
         }
         logger.info(f"    PPL: {ppl:.2f}, avg bits: {results['avg_bits']:.3f}")
 
-        base_model.cpu()  # force weights off GPU before del
+        # Free GPU memory in-place — no CPU transfer needed (avoids
+        # 2.5 GB CPU RAM spike from .cpu() when RAM is near limit)
+        with torch.no_grad():
+            for param in base_model.parameters():
+                param.data = param.data.new_empty(0)
+        # Free quantizer large tensors explicitly before Python GC
+        if hasattr(quantizer, "bit_map"):
+            quantizer.bit_map = None
+        if hasattr(quantizer, "salience_map"):
+            quantizer.salience_map = None
         del base_model, quantizer, evaluator, results
+        torch.cuda.synchronize()
         gc.collect()
         torch.cuda.empty_cache()
 
