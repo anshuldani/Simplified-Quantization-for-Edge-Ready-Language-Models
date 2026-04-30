@@ -63,7 +63,7 @@ def load_model_and_tokenizer(model_name: str, device: str = "cuda"):
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.float16,   # FP16 loading saves ~2 GB VRAM on T4; kernels upcast internally
-        device_map="auto" if device == "cuda" else None,
+        device_map={"": device} if device == "cuda" else None,  # force all layers onto GPU 0
         trust_remote_code=True,
     )
 
