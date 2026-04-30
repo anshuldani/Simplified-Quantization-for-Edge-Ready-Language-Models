@@ -108,7 +108,7 @@ class GradientSalience:
             logger.warning(f"No gradient found for {param_name}, using magnitude fallback")
             return weight.abs()
 
-        grad = self._grad_accumulator[param_name]  # already on CPU
+        grad = self._grad_accumulator.pop(param_name)  # pop frees ~50-268 MB as salience_map grows
         return (weight.cpu().abs() * grad).detach()  # multiply on CPU; result stored as .cpu() by caller
 
     def reset(self):
@@ -149,7 +149,7 @@ class HessianSalience:
             logger.warning(f"No Fisher info for {param_name}, using magnitude fallback")
             return weight.abs()
 
-        fisher = self._fisher_accumulator[param_name] / self._n_samples
+        fisher = self._fisher_accumulator.pop(param_name) / self._n_samples  # pop frees entry after use
         return fisher.detach()  # already on CPU; caller does .cpu() anyway
 
     def reset(self):
