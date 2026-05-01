@@ -301,6 +301,10 @@ def _get_ablation_configs(ablation_type: str) -> Dict[str, QuantizerConfig]:
     """Generate configs for each ablation type."""
     configs = {}
 
+    # Hessian is excluded from all non-salience_metric ablations:
+    # gradient + hessian fp32 accumulators together = ~10 GB CPU RAM on T4 → OOM.
+    _SAFE_METRICS = ["magnitude_l1", "magnitude_l2", "gradient", "activation"]
+
     if ablation_type == "salience_metric":
         for metric in ["magnitude_l1", "magnitude_l2", "gradient", "hessian", "activation"]:
             sal_config = SalienceConfig(metrics=[metric])
@@ -308,49 +312,57 @@ def _get_ablation_configs(ablation_type: str) -> Dict[str, QuantizerConfig]:
                 salience=sal_config,
                 allocation=AllocationConfig(target_avg_bits=1.61),
             )
-        # Also test ensemble (hessian excluded: too memory-intensive for T4 —
-        # combined gradient+hessian accumulators = ~10 GB CPU, near T4 limit)
+        # Also test ensemble (hessian excluded: too memory-intensive for T4)
         configs["combined"] = QuantizerConfig(
-            salience=SalienceConfig(metrics=["magnitude_l1", "magnitude_l2", "gradient", "activation"]),
+            salience=SalienceConfig(metrics=_SAFE_METRICS),
             allocation=AllocationConfig(target_avg_bits=1.61),
         )
 
     elif ablation_type == "bit_budget":
         for target_bits in [1.0, 1.3, 1.61, 2.0, 2.5, 3.0, 4.0]:
             configs[f"target_{target_bits}b"] = QuantizerConfig(
-                allocation=AllocationConfig(target_avg_bits=target_bits)
+                salience=SalienceConfig(metrics=_SAFE_METRICS),
+                allocation=AllocationConfig(target_avg_bits=target_bits),
             )
 
     elif ablation_type == "calibration_size":
         for n_samples in [128, 256, 512, 1024]:
-            sal_config = SalienceConfig(n_calibration_samples=n_samples)
-            configs[f"n{n_samples}"] = QuantizerConfig(salience=sal_config)
+            configs[f"n{n_samples}"] = QuantizerConfig(
+                salience=SalienceConfig(
+                    metrics=_SAFE_METRICS,
+                    n_calibration_samples=n_samples,
+                ),
+                allocation=AllocationConfig(target_avg_bits=1.61),
+            )
 
     elif ablation_type == "granularity":
         for granularity in ["weight", "channel", "layer"]:
             configs[granularity] = QuantizerConfig(
+                salience=SalienceConfig(metrics=_SAFE_METRICS),
                 allocation=AllocationConfig(
                     target_avg_bits=1.61,
                     granularity=granularity,
-                )
+                ),
             )
 
     elif ablation_type == "quant_scheme":
         for scheme in ["symmetric", "asymmetric"]:
             configs[scheme] = QuantizerConfig(
+                salience=SalienceConfig(metrics=_SAFE_METRICS),
                 scheme_2bit=scheme,
                 allocation=AllocationConfig(target_avg_bits=1.61),
             )
 
     elif ablation_type == "ensemble_weights":
-        # Vary the ensemble α weights to understand metric contributions
+        # Vary α weights across the 4 safe metrics (l1, l2, gradient, activation).
+        # Hessian excluded — too memory-intensive for T4.
+        # Tuples: (alpha_l1, alpha_l2, alpha_gradient, alpha_activation)
         weight_configs = {
-            "magnitude_heavy":  (0.30, 0.30, 0.15, 0.15, 0.10),
-            "gradient_heavy":   (0.10, 0.10, 0.40, 0.30, 0.10),
-            "hessian_heavy":    (0.10, 0.10, 0.20, 0.50, 0.10),
-            "activation_heavy": (0.10, 0.10, 0.15, 0.15, 0.50),
-            "uniform":          (0.20, 0.20, 0.20, 0.20, 0.20),
-            "default":          (0.15, 0.15, 0.25, 0.25, 0.20),
+            "magnitude_heavy":  (0.35, 0.35, 0.15, 0.15),
+            "gradient_heavy":   (0.10, 0.10, 0.60, 0.20),
+            "activation_heavy": (0.10, 0.10, 0.20, 0.60),
+            "uniform":          (0.25, 0.25, 0.25, 0.25),
+            "default":          (0.18, 0.18, 0.32, 0.32),
         }
         for name, (al1, al2, ag, aa) in weight_configs.items():
             sal_config = SalienceConfig(
@@ -459,22 +471,4 @@ def main():
         for ablation_type in cfg.get("ablation_types", ["salience_metric"]):
             run_ablation_study(
                 model_name, tokenizer, calibration_dataloader,
-                eval_datasets, device, output_dir, ablation_type,
-            )
-
-    # Final summary
-    tracker.print_summary()
-
-    # Final comparison plot
-    if len(tracker.results["models"]) > 1:
-        plot_baseline_comparison(
-            tracker.results["models"],
-            output_path=os.path.join(output_dir, "plots", "baseline_comparison.png"),
-            model_name=model_name,
-        )
-
-    logger.info(f"\nAll results saved to: {output_dir}")
-
-
-if __name__ == "__main__":
-    main()
+            
