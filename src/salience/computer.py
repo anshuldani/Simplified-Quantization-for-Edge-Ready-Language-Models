@@ -211,6 +211,15 @@ class SalienceComputer:
                 salience_map[param_name] = self.ensemble.combine(scores).cpu()
             del scores  # free intermediate per-metric tensors immediately
 
+            # Free per-param accumulator entries immediately after use.
+            # Without this, the full gradient accumulator (~3.9 GB) and the
+            # growing salience_map (~3.9 GB) coexist in RAM at end of loop,
+            # pushing Colab over its ~12 GB limit at param 111/112.
+            # Draining them in parallel keeps peak RAM ~halved (~4 GB).
+            self.gradient_metric._grad_accumulator.pop(param_name, None)
+            self.hessian_metric._fisher_accumulator.pop(param_name, None)
+            self.activation_metric._activation_stats.pop(layer_name, None)
+
         # Cleanup
         self.gradient_metric.reset()
         self.hessian_metric.reset()
