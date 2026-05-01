@@ -352,13 +352,12 @@ def _get_ablation_configs(ablation_type: str) -> Dict[str, QuantizerConfig]:
             "uniform":          (0.20, 0.20, 0.20, 0.20, 0.20),
             "default":          (0.15, 0.15, 0.25, 0.25, 0.20),
         }
-        for name, (al1, al2, ag, ah, aa) in weight_configs.items():
+        for name, (al1, al2, ag, aa) in weight_configs.items():
             sal_config = SalienceConfig(
-                metrics=["magnitude_l1", "magnitude_l2", "gradient", "hessian", "activation"],
+                metrics=_SAFE_METRICS,
                 alpha_magnitude_l1=al1,
                 alpha_magnitude_l2=al2,
                 alpha_gradient=ag,
-                alpha_hessian=ah,
                 alpha_activation=aa,
             )
             configs[name] = QuantizerConfig(
