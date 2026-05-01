@@ -471,4 +471,22 @@ def main():
         for ablation_type in cfg.get("ablation_types", ["salience_metric"]):
             run_ablation_study(
                 model_name, tokenizer, calibration_dataloader,
-            
+                            eval_datasets, device, output_dir, ablation_type,
+            )
+
+    # Final summary
+    tracker.print_summary()
+
+    # Final comparison plot
+    if len(tracker.results["models"]) > 1:
+        plot_baseline_comparison(
+            tracker.results["models"],
+            output_path=os.path.join(output_dir, "plots", "baseline_comparison.png"),
+            model_name=model_name,
+        )
+
+    logger.info(f"\nAll results saved to: {output_dir}")
+
+
+if __name__ == "__main__":
+    main()
