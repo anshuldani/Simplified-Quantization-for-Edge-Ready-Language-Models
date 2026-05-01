@@ -243,10 +243,20 @@ def run_ablation_study(
     """
     logger.info(f"\nRunning ablation: {ablation_type}")
 
-    ablation_results = {}
+    # Resume from partial checkpoint if a previous run crashed mid-ablation.
+    partial_path = os.path.join(output_dir, f"ablation_{ablation_type}_partial.json")
+    if os.path.exists(partial_path):
+        with open(partial_path) as f:
+            ablation_results = json.load(f)
+        logger.info(f"  Resuming from partial checkpoint: {list(ablation_results.keys())} already done")
+    else:
+        ablation_results = {}
     ablation_configs = _get_ablation_configs(ablation_type)
 
     for config_name, config in ablation_configs.items():
+        if config_name in ablation_results:
+            logger.info(f"  Skipping {config_name} (already in checkpoint)")
+            continue
         logger.info(f"  Ablation config: {config_name}")
 
         base_model, _ = load_model_and_tokenizer(model_name, device)
@@ -268,6 +278,10 @@ def run_ablation_study(
             "avg_bits": results["avg_bits"],
         }
         logger.info(f"    PPL: {ppl:.2f}, avg bits: {results['avg_bits']:.3f}")
+
+        # Save incrementally — partial results survive a crash mid-ablation.
+        with open(partial_path, "w") as f:
+            json.dump(ablation_results, f, indent=2)
 
         # Free weights in-place before del — avoids a 2.5 GB CPU spike that
         # .cpu() / Python GC would otherwise cause on a nearly-full T4.
