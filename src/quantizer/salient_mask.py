@@ -127,6 +127,16 @@ class SalientMaskQuantizer:
         if self.device == "cuda":
             torch.cuda.empty_cache()
 
+        # Downcast salience_map to float16 before allocation.
+        # float32 salience_map for LLaMA-1B = 3.9 GB CPU RAM.
+        # float16 halves this to 1.95 GB, giving Phase 2 (which also builds a
+        # 973 MB bit_map) enough headroom on Colab's ~12 GB RAM.
+        # Ranking accuracy is unaffected — we only need relative ordering.
+        self.salience_map = {
+            k: v.half() for k, v in self.salience_map.items()
+        }
+        import gc as _gc; _gc.collect()
+
         # Log global salience stats
         stats = self.salience_computer.get_salience_stats(self.salience_map)
         if "_global" in stats:
