@@ -1,0 +1,22 @@
+{
+  "magnitude_heavy": {
+    "perplexity": 21977.30100341747,
+    "avg_bits": 1.6048344959472787
+  },
+  "gradient_heavy": {
+    "perplexity": 49095.45993191986,
+    "avg_bits": 1.601387080447427
+  },
+  "activation_heavy": {
+    "perplexity": 34803.37434398979,
+    "avg_bits": 1.5992906710197186
+  },
+  "uniform": {
+    "perplexity": 34778.75799146232,
+    "avg_bits": 1.6041364628693153
+  },
+  "default": {
+    "perplexity": 30895.827609675904,
+    "avg_bits": 1.6025669821377457
+  }
+}

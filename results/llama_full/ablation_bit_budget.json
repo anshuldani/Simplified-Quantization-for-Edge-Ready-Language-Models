@@ -1,0 +1,30 @@
+{
+  "target_1.0b": {
+    "perplexity": 90337.0109413065,
+    "avg_bits": 1.0
+  },
+  "target_1.3b": {
+    "perplexity": 43287.65077475036,
+    "avg_bits": 1.283399085546362
+  },
+  "target_1.61b": {
+    "perplexity": 29720.553938979363,
+    "avg_bits": 1.6030078807781483
+  },
+  "target_2.0b": {
+    "perplexity": 113581.83713811533,
+    "avg_bits": 2.0
+  },
+  "target_2.5b": {
+    "perplexity": 113581.83713811533,
+    "avg_bits": 2.0
+  },
+  "target_3.0b": {
+    "perplexity": 113581.83713811533,
+    "avg_bits": 2.0
+  },
+  "target_4.0b": {
+    "perplexity": 113581.83713811533,
+    "avg_bits": 2.0
+  }
+}
