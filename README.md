@@ -2,8 +2,7 @@
 
 **CS595-2 Final Project — Illinois Institute of Technology**
 Anshul Dani (A20580060) · Rohit Lahori (A20582911)
-
-**Project type:** Engineering / Measurement (with research-prototype elements).
+**Status:** Submitted, May 2026 · **License:** MIT · **Project type:** Engineering / Measurement
 
 📄 **[Final report (9 pages, PDF)](report/report.pdf)** · 📊 **[Ablation JSONs](results/llama_full/)** · 🧪 **[Colab reproduction notebook](notebooks/salient_quant_colab.ipynb)**
 
