@@ -70,3 +70,21 @@ slurm-*.out
 # Environment / secrets
 .env
 *.env
+
+# LaTeX build artifacts (keep .tex and .pdf, ignore the rest)
+report/*.aux
+report/*.log
+report/*.out
+report/*.toc
+report/*.lof
+report/*.lot
+report/*.fls
+report/*.fdb_latexmk
+report/*.synctex.gz
+report/*.tex.zip
+
+# Generated submission packages
+submission/
+
+# Local result snapshots from CPU-only runs (kept off the artifact)
+results/gpt2_quick/
