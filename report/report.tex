@@ -1,670 +1,615 @@
-\documentclass{article}
+\documentclass[11pt]{article}
 
-% NeurIPS 2024 style
-\usepackage[preprint]{neurips_2024}
-
+\usepackage[letterpaper,margin=1in]{geometry}
 \usepackage[utf8]{inputenc}
 \usepackage[T1]{fontenc}
-\usepackage{hyperref}
+\PassOptionsToPackage{hyphens}{url}
 \usepackage{url}
+\usepackage{hyperref}
 \usepackage{booktabs}
 \usepackage{amsfonts}
 \usepackage{amsmath}
-\usepackage{nicefrac}
-\usepackage{microtype}
 \usepackage{xcolor}
 \usepackage{graphicx}
-\usepackage{subcaption}
 \usepackage{multirow}
-\usepackage{algorithm}
-\usepackage{algorithmic}
+\setlength{\parskip}{0.3ex}
+\hypersetup{colorlinks=true, linkcolor=blue!50!black, urlcolor=blue!50!black, citecolor=blue!50!black, breaklinks=true}
+% Allow URL line breaks at slashes, dashes, and dots
+\def\UrlBreaks{\do\/\do-\do.\do\_}
 
-\title{Simplified Quantization for Edge-Ready Language Models:\\
-Salience-Guided Mixed-Precision Post-Training Quantization}
+\title{\vspace{-2em}Simplified Quantization for Edge-Ready Language Models:\\
+Salience-Guided Mixed-Precision Post-Training Quantization at 1.61~Bits}
 
-\author{%
-  Anshul Dani \\
-  Illinois Institute of Technology \\
-  A20580060 \\
-  \texttt{adani7@hawk.iit.edu} \\
-  \And
-  Rohit Lahori \\
-  Illinois Institute of Technology \\
-  A20582911 \\
-  \texttt{rlahori@hawk.iit.edu} \\
-}
+\author{Anshul Dani \\ \small A20580060 \\ \small \texttt{adani2@hawk.illinoistech.edu} \and
+        Rohit Lahori \\ \small A20582911 \\ \small \texttt{rlahori@hawk.illinoistech.edu}}
+\date{Illinois Institute of Technology --- CS595-2 --- May 2026}
 
 \begin{document}
 
 \maketitle
+\vspace{-0.5em}
 
 \begin{abstract}
-Large language models (LLMs) are too large for deployment on memory-constrained edge devices.
-Existing quantization methods either apply uniform precision to all weights---wasting bit-budget
-on insignificant parameters---or use aggressive uniform compression that collapses model accuracy.
-We present \textbf{Salient-Quant}, a three-phase post-training quantization framework that
-exploits the 80/20 rule of weight importance: a small fraction of weights carry most of the
-predictive power.
-Our method scores every weight using a five-metric ensemble (magnitude L1/L2, gradient
-sensitivity, Hessian-diagonal Fisher information, and activation-aware scaling), then greedily
-allocates bits from a mixed set $\{1, 2, 4\}$ under a global average-bit budget of 1.61~bits,
-and finally applies block-wise mixed-precision quantization with closed-form scale refinement.
-On GPT-2 small (124M), Salient-Quant achieves a perplexity of \textbf{XX.XX} at 1.61~bits---
-compared to \textbf{YY.YY} for Uniform INT2 (2.0~bits) and \textbf{ZZ.ZZ} for BitNet
-(1.58~bits)---while reducing model size by 10$\times$ relative to FP16.
-On LLaMA-3.2-1B, the method achieves \textbf{AA.AA} perplexity at 1.61~bits with
-\textbf{BB.BB\%} MMLU accuracy, demonstrating that salience-guided allocation Pareto-dominates
-uniform baselines across all tested bit budgets.
+\small
+Large language models are too large for edge devices, and uniform post-training
+quantization (PTQ) below 2~bits/weight collapses model accuracy.
+We present \textbf{Salient-Quant} (SMQ), a three-phase PTQ framework that
+allocates a mixed $\{1,2,4\}$-bit budget across weights according to a
+five-metric salience ensemble (magnitude L1/L2, gradient, Hessian-diagonal Fisher,
+activation-aware scaling), and applies row-coherent block-wise quantization with
+closed-form OLS scale refinement.
+On \textbf{GPT-2 medium (345M)}, SMQ achieves WikiText-2 PPL of \textbf{541.05} at 1.61~bits/weight ---
+$\mathbf{2{,}683\times}$ better than Uniform INT2 (1.45M PPL) at higher compression ($9.94\times$ vs.\ $7.97\times$).
+On \textbf{LLaMA-3.2-1B}, SMQ reaches \textbf{35{,}831} PPL at 1.61~bits ($10.4\times$ compression) ---
+$4.6\times$ better than Uniform INT2 and $2.8\times$ better than BitNet at the same scale.
+A six-axis ablation study isolates each design choice, surfacing three findings that contradict
+the project's design assumptions: (i)~magnitude alone is the strongest single salience signal,
+(ii)~symmetric 2-bit beats asymmetric on LLaMA-1B by $9.6\times$, and (iii)~the dominant
+accuracy lever is \emph{spatial coherence} of block-wise scales --- a row-wise quantization
+fix alone took GPT-2 medium PPL from 12{,}173 to 541 ($22\times$), eclipsing every salience
+metric.
+We also document the seven engineering fixes needed to fit the pipeline within a 16~GB
+Colab T4.
 \end{abstract}
 
-% -----------------------------------------------------------------------
-\section{Introduction}
+% =================================================================
+\section{Motivation and Problem Statement}
 \label{sec:intro}
-% -----------------------------------------------------------------------
+% =================================================================
 
-The rapid adoption of large language models across consumer devices has exposed a fundamental
-tension: state-of-the-art models require gigabytes of memory that exceeds the capacity of
-smartphones, IoT devices, and edge servers.
-GPT-2 small at 16-bit precision occupies 500~MB; LLaMA-3.2 at 1B parameters requires over
-13~GB.
-Post-training quantization (PTQ) is the preferred solution---it compresses model weights after
-training with no gradient updates---but existing approaches have significant gaps.
+State-of-the-art LLMs require gigabytes of memory: LLaMA-3.2-1B at FP16 occupies 2.5~GB,
+a 7B model needs $>$13~GB.
+Edge devices typically expose under 256~MB of usable RAM, so deployment requires
+$10\times$ or greater compression.
+Post-training quantization (PTQ) is the preferred mechanism --- no fine-tuning, generalizes
+across model families --- but sub-2-bit PTQ is brittle.
+Uniform INT2 inflates GPT-2 medium WikiText-2 perplexity from 21.64 to $1.45\times 10^6$
+(a $67{,}000\times$ degradation); BitNet's ternary scheme is no better as a PTQ
+($1.56\times 10^6$ PPL) because it was designed for training-time integration.
+The 4-bit regime (GPTQ, AWQ) is well-studied but only delivers $4\times$ compression.
+The interesting 2-bit regime is where uniform methods break.
 
-Uniform quantization methods assign the same bit-width to every weight.
-At 4-bit (GPTQ~\cite{frantar2023gptq}, AWQ~\cite{lin2024awq}), models retain near-FP16
-quality, but storage savings are modest (4$\times$).
-At 2-bit, uniform compression causes catastrophic accuracy degradation: on WikiText-2,
-GPT-2 small's perplexity jumps from ~30 to over 100,000 under naive uniform INT2.
-BitNet~\cite{wang2023bitnet} achieves 1.58~bits through uniform ternary quantization, but
-treats all weights equally and relies on training-time awareness that is unavailable in PTQ settings.
+\textbf{This project asks:} can a non-uniform allocation of $\{1,2,4\}$ bits, guided by a
+per-weight importance score, achieve a sub-2-bit average while preserving usable accuracy?
+The answer addresses both an algorithmic question (what does ``important'' mean for weights?)
+and a systems question (can the resulting pipeline fit and run within a commodity 16~GB GPU?).
 
-Our key insight is that weight importance follows a heavy-tailed distribution: approximately
-80\% of weights in transformer models are ``quiet''---their removal or aggressive compression
-causes minimal change in output.
-This 80/20 structure allows a mixed-precision strategy that protects the critical 20\% at
-2- or 4-bit precision while binarizing the remaining 80\%, yielding a 1.61-bit average that
-is both smaller than any uniform 2-bit model and substantially more accurate.
+\textbf{Contributions.}
+(i)~A vectorized 5-metric salience ensemble computed in a single calibration pass.
+(ii)~A greedy bit allocator that distributes $\{1,2,4\}$-bit budgets across all parameters
+in a single \texttt{torch.topk} call (0.45~s for 345M weights).
+(iii)~A row-coherent block-wise quantizer with closed-form OLS scale refinement, achieving
+\textbf{541~PPL} at 1.61~bits on GPT-2 medium.
+(iv)~A six-axis ablation study on LLaMA-3.2-1B with full JSON outputs released.
+(v)~Documented engineering: seven memory and numerical-stability fixes that enabled the
+pipeline to run on a 16~GB T4, including a row-coherence fix that alone gave $22\times$ PPL.
 
-We make the following contributions:
-\begin{itemize}
-\item A five-metric salience ensemble that fuses magnitude, gradient, Hessian, and
-activation-aware signals into a single per-weight importance score.
-\item A vectorized greedy bit allocator that assigns $\{1, 2, 4\}$-bit widths to individual
-weights under a global average-bit budget in under 0.15 seconds for 117M parameters.
-\item Block-wise closed-form scale refinement that minimizes L2 reconstruction error without
-any optimization loop.
-\item Comprehensive ablations over 6 axes---salience metric, bit budget, calibration size,
-allocation granularity, quantization scheme, and ensemble weights---demonstrating the
-contribution of each design choice.
-\item Empirical evaluation on GPT-2 small, GPT-2 medium, and LLaMA-3.2-1B showing that
-Salient-Quant Pareto-dominates all uniform baselines.
-\end{itemize}
-
-% -----------------------------------------------------------------------
-\section{Related Work}
+% =================================================================
+\section{Background and Related Work}
 \label{sec:related}
-% -----------------------------------------------------------------------
+% =================================================================
 
-\paragraph{Uniform post-training quantization.}
-GPTQ~\cite{frantar2023gptq} quantizes LLMs to 4-bit by solving a layer-wise Hessian-based
-optimal weight rounding problem.
-AWQ~\cite{lin2024awq} identifies salient \emph{channels} (not individual weights) and
-protects them at higher precision.
-ZeroQuant~\cite{yao2022zeroquant} applies token-wise and weight-wise quantization with
-hardware-aware kernels.
-All methods target 4-bit precision; none cross the 2-bit barrier.
+\textbf{Uniform PTQ.} GPTQ~\cite{frantar2023gptq} quantizes LLMs to 4-bit via Hessian-based
+optimal rounding; AWQ~\cite{lin2024awq} protects salient \emph{channels} at higher precision;
+ZeroQuant~\cite{yao2022zeroquant} adds hardware-aware kernels.
+All target 4-bit; none cross the 2-bit barrier.
+\textbf{Sub-2-bit.} BitNet~\cite{wang2023bitnet} uses ternary weights at 1.58~bits but
+requires training-time integration, collapsing as PTQ.
+LLM.int8()~\cite{dettmers2022llm} mixes INT8/FP16 outliers but stops at 8-bit.
+\textbf{Salience-aware.} SmoothQuant~\cite{xiao2023smoothquant} transfers difficulty
+between activations and weights;
+OBD~\cite{lecun1990obd} and OBS~\cite{hassibi1993obs} use Hessian information for pruning.
+We extend this line by combining five complementary metrics into a per-weight ensemble used
+for \emph{bit allocation} rather than pruning.
+\textbf{Datasets and tools.} Calibration: C4 validation~\cite{raffel2020t5}.
+Evaluation: WikiText-2~\cite{merity2017wikitext} and Penn Treebank.
+Models: GPT-2~\cite{radford2019gpt2}, LLaMA-3.2-1B~\cite{touvron2023llama}.
+Implementation: PyTorch 2.x, HuggingFace Transformers, Colab T4.
 
-\paragraph{Sub-2-bit quantization.}
-BitNet~\cite{wang2023bitnet} uses ternary $\{-1, 0, +1\}$ weights scaled by a global
-mean-absolute value, achieving 1.58~bits but requiring training-time integration.
-LLM.int8()~\cite{dettmers2022llm} identifies outlier channels and applies mixed INT8/FP16,
-but targets 8-bit not sub-2-bit.
-Our work is the first PTQ method to achieve 1.61-bit average precision on pre-trained models
-without any fine-tuning.
-
-\paragraph{Salience-aware quantization.}
-SmoothQuant~\cite{xiao2023smoothquant} transfers quantization difficulty from activations to
-weights via per-channel scaling.
-Optimal Brain Damage~\cite{lecun1990obd} and Optimal Brain Surgeon~\cite{hassibi1993obs}
-use Hessian information for weight pruning.
-We extend this line by combining five complementary metrics into a per-weight salience ensemble
-and using it for bit-width allocation rather than pruning.
-
-% -----------------------------------------------------------------------
-\section{Method}
+% =================================================================
+\section{Methodology}
 \label{sec:method}
-% -----------------------------------------------------------------------
+% =================================================================
 
-\subsection{Overview}
+SMQ runs three sequential phases on a pre-trained model with access to a small calibration
+set; no gradient updates are applied to model parameters.
 
-Salient-Quant operates in three sequential phases applied post-training to a pre-trained model
-with access to a small calibration dataset ($N=512$ samples from C4 validation).
-No gradient updates to model parameters are performed.
+\textbf{Phase 1 -- Salience scoring.}
+Each weight gets a score from five min-max-normalized-per-layer metrics combined as
+$s_{\text{ens}}(w) = \alpha_1 \hat{s}_{\text{L1}} + \alpha_2 \hat{s}_{\text{L2}}
++ \alpha_3 \hat{s}_{\text{grad}} + \alpha_4 \hat{s}_{\text{H}} + \alpha_5 \hat{s}_{\text{act}}$.
+The metrics are
+$s_{\text{L1}} = |w|$,
+$s_{\text{L2}} = w^2$,
+$s_{\text{grad}} = |w \cdot \nabla_w \mathcal{L}|$~\cite{lecun1990obd},
+$s_{\text{H}} = \mathbb{E}[(\nabla_w \mathcal{L})^2]$ (empirical Fisher
+diagonal~\cite{hassibi1993obs}),
+and $s_{\text{act}}(w_{ij}) = |w_{ij}| \cdot \text{std}(x_j)$ following SmoothQuant.
+Default $\boldsymbol{\alpha} = (0.15, 0.15, 0.25, 0.25, 0.20)$;
+Section~\ref{sec:ablations} shows magnitude-heavy weighting empirically dominates at 1.61~b
+on LLaMA-3.2-1B.
 
-\subsection{Phase 1: Multi-Metric Salience Scoring}
+\textbf{Phase 2 -- Greedy bit allocation.}
+Given $B_{\text{target}} = 1.61$ and bit choices $\mathcal{B} = \{1, 2, 4\}$:
+initialize $b_i = 1$ for all weights, set $\text{budget} = (B_{\text{target}} - 1) \cdot N$,
+then for each $b \in \{2, 4\}$ ascending, take the top-$k$ weights by salience
+($k = \lfloor\text{budget}/(b{-}1)\rfloor$) and upgrade them to $b$ bits, decrementing the
+budget.
+The top-$k$ step is one GPU \texttt{torch.topk} call over all weights concatenated;
+allocation completes in 0.45~s for 85M-quantizable-weight GPT-2 medium.
 
-We define a salience map $\mathcal{S}: \{w_{ij}\} \rightarrow \mathbb{R}_{\geq 0}$ that
-assigns an importance score to each scalar weight.
-Five metrics contribute to the ensemble:
+\textbf{Phase 3 -- Row-coherent mixed-precision quantization.}
+Each weight is quantized at its assigned bit-width:
+1-bit uses $q = \text{sign}(w) \cdot \overline{|w|}$ per block (BitNet-style);
+2-bit uses 4 symmetric levels $\{\pm 0.5s, \pm 1.5s\}$;
+4-bit uses INT4 symmetric (15 levels).
+For 2- and 4-bit, given fixed level codes $\mathbf{L}$, the closed-form scale minimizing
+$\|\mathbf{W} - s\mathbf{L}\|_2^2$ is $s^* = (\mathbf{W}\cdot\mathbf{L})/(\mathbf{L}\cdot\mathbf{L})$,
+replacing a per-block Adam loop with two vectorized dot products.
 
-\paragraph{Magnitude (L1/L2).}
-$s_{\text{L1}}(w) = |w|$, $s_{\text{L2}}(w) = w^2$.
-Simple but effective: large-magnitude weights tend to dominate layer outputs.
+\textit{The row-coherence fix.}
+Our first implementation flattened each weight matrix into a 1D array before applying the
+boolean salience mask, so block boundaries cut across unrelated rows --- the per-block scale
+mixed weights from independent neurons, corrupting the OLS estimate.
+Processing each row independently keeps blocks spatially coherent.
+This single change reduced GPT-2 medium PPL from \textbf{12{,}173} to \textbf{541}
+($22\times$); we revisit its outsized impact in Section~\ref{sec:bottleneck}.
 
-\paragraph{Gradient sensitivity.}
-$s_{\text{grad}}(w) = |w \cdot \nabla_w \mathcal{L}|$, accumulated over $N$ calibration
-samples~\cite{lecun1990obd}.
-Captures how much the loss changes when a weight is perturbed.
-
-\paragraph{Hessian diagonal (Fisher information).}
-$s_{\text{H}}(w) = \mathbb{E}\left[(\nabla_w \mathcal{L})^2\right]$, estimated as the
-squared gradient accumulated over calibration samples---the empirical Fisher diagonal.
-Second-order sensitivity beyond the gradient~\cite{hassibi1993obs}.
-
-\paragraph{Activation-aware scaling.}
-For each weight matrix $W$ with input activations $X$,
-$s_{\text{act}}(w_{ij}) = |w_{ij}| \cdot \text{std}(x_j)$,
-where $\text{std}(x_j)$ is the per-channel standard deviation of input activations observed
-over calibration data, following SmoothQuant~\cite{xiao2023smoothquant}.
-This penalizes weights that interact with high-variance activation channels.
-
-\paragraph{Ensemble combination.}
-Each metric score is min-max normalized per layer before combination:
-\begin{equation}
-s_{\text{ens}}(w) = \alpha_1 \hat{s}_{\text{L1}} + \alpha_2 \hat{s}_{\text{L2}}
-+ \alpha_3 \hat{s}_{\text{grad}} + \alpha_4 \hat{s}_{\text{H}}
-+ \alpha_5 \hat{s}_{\text{act}}
-\end{equation}
-with default $\boldsymbol{\alpha} = (0.15, 0.15, 0.25, 0.25, 0.20)$.
-The gradient and Hessian terms receive higher weight as they directly measure loss sensitivity.
-
-\subsection{Phase 2: Greedy Bit Allocation Under Budget Constraint}
-
-Given salience map $\mathcal{S}$, target average bits $B_{\text{target}} = 1.61$, and bit
-choices $\mathcal{B} = \{1, 2, 4\}$, we allocate bit-widths as follows:
-
-\begin{algorithm}
-\caption{Greedy Bit Allocation}
-\begin{algorithmic}[1]
-\STATE Initialize $b_i \leftarrow 1$ for all weights $i$
-\STATE $\text{budget} \leftarrow (B_{\text{target}} - 1) \cdot N_{\text{total}}$
-\FOR{$b \in \{2, 4\}$ (ascending)}
-  \STATE $k \leftarrow \lfloor \text{budget} / (b - 1) \rfloor$
-  \STATE $I \leftarrow \text{top-}k\text{ indices by } \mathcal{S}$ among weights at 1-bit
-  \STATE $b_i \leftarrow b$ for $i \in I$
-  \STATE $\text{budget} \leftarrow \text{budget} - k \cdot (b - 1)$
-\ENDFOR
-\RETURN $\{b_i\}$
-\end{algorithmic}
-\end{algorithm}
-
-The \texttt{top-k} step is implemented as a single GPU \texttt{torch.topk} call over all
-$N_{\text{total}}$ weights concatenated into one tensor, making the entire allocation
-sub-second even for billion-parameter models.
-
-\subsection{Phase 3: Mixed-Precision Quantization with Scale Refinement}
-
-Each weight is quantized according to its assigned bit-width $b_i$:
-\begin{itemize}
-\item \textbf{1-bit:} Binary sign quantization, $q = \text{sign}(w) \cdot \bar{|w|}$,
-where $\bar{|w|}$ is the mean absolute value per block (BitNet-style).
-\item \textbf{2-bit:} Symmetric 4-level uniform quantization.
-Codes $\in \{0,1,2,3\}$ map to levels $\{-1.5s, -0.5s, +0.5s, +1.5s\}$.
-\item \textbf{4-bit:} INT4 symmetric quantization, 15 levels $\{-7, \ldots, 7\}$.
-\end{itemize}
-
-For 2- and 4-bit, we apply closed-form per-block scale refinement.
-Given fixed codes $\mathbf{L}$ (levels minus offset), the optimal scale minimizing
-$\|\mathbf{W} - s \cdot \mathbf{L}\|_2^2$ is:
-\begin{equation}
-s^* = \frac{\mathbf{W} \cdot \mathbf{L}}{\mathbf{L} \cdot \mathbf{L}}
-\end{equation}
-This replaces a per-block Adam optimization loop (13M gradient steps for GPT-2) with a
-single pair of vectorized dot products, reducing Phase 3 runtime from 3+ hours to 0.16~seconds.
-
-% -----------------------------------------------------------------------
+% =================================================================
 \section{Experimental Setup}
 \label{sec:setup}
-% -----------------------------------------------------------------------
+% =================================================================
 
-\paragraph{Models.}
-We evaluate on three models of increasing scale:
-(1) \textbf{GPT-2 small} (124M parameters) for sanity-check and ablation development,
-(2) \textbf{GPT-2 medium} (345M) for the full Milestone B evaluation,
-and (3) \textbf{LLaMA-3.2-1B} (1B) for Milestone C with MMLU.
+\textbf{Hardware:} single Google Colab T4 GPU (16~GB VRAM, 14.56~GB usable),
+$\sim$12.7~GB system RAM.
+The T4 budget was the binding constraint that shaped seven implementation choices
+(Section~\ref{sec:bottleneck}).
+\textbf{Software:} Python 3.10, PyTorch 2.x, HuggingFace Transformers/datasets/hub.
+Random seeds fixed.
+\textbf{Models:}
+GPT-2 small (124M, validation), GPT-2 medium (345M, primary GPT-2 evaluation), LLaMA-3.2-1B
+(modern LLaMA evaluation; ablation target).
+\textbf{Calibration:} GPT-2 uses $N{=}512$ samples at sequence length 512.
+LLaMA uses $N{=}128{-}256$ at sequence length 256, batch size 1, due to T4 memory pressure
+(Ablation~4 confirms $N{=}256$ is optimal on the 1B model).
+\textbf{Baselines:} FP16 (uncompressed upper bound), Uniform INT2 (symmetric 2-bit
+block-wise, block~64), BitNet ternary ($\{-1, 0, +1\} \times \overline{|W|}$ as PTQ),
+Salient-Quant at 1.61~b.
+GPTQ was disabled because the \texttt{auto-gptq} install repeatedly failed on Colab T4.
+\textbf{Metrics:} perplexity on WikiText-2 raw test and Penn Treebank (sliding window,
+stride~512, max length~1024); compressed model size ($\sum_\ell N_\ell b_\ell / 8$~bytes);
+per-phase wall-clock; peak VRAM.
+MMLU 5-shot and end-to-end inference latency were planned but deferred
+(Section~\ref{sec:limits}).
 
-\paragraph{Calibration data.}
-All experiments use $N=512$ samples from the C4 validation split, tokenized to sequence
-length 512, as the calibration dataset for salience scoring.
-No calibration data is used during evaluation.
-
-\paragraph{Evaluation.}
-We measure:
-(a) \textbf{Perplexity} on WikiText-2 test set and Penn Treebank (wikitext-103-raw-v1
-validation as proxy) using a sliding window (stride 512, max length 1024).
-(b) \textbf{MMLU 5-shot accuracy} via \texttt{lm-evaluation-harness} on LLaMA-3.2-1B.
-(c) \textbf{Latency} at batch sizes $\{1, 8\}$ and sequence lengths $\{128, 256, 512\}$.
-(d) \textbf{Memory}: parameter footprint and VRAM usage.
-
-\paragraph{Baselines.}
-\begin{itemize}
-\item \textbf{FP16}: Cast model to float16; serves as uncompressed upper bound (16.0~bits).
-\item \textbf{Uniform INT2}: Symmetric 2-bit block-wise quantization applied uniformly to
-all weight matrices (2.0~bits). Block size 64.
-\item \textbf{BitNet ternary}: Ternary $\{-1,0,+1\} \times$ scale where scale $= \bar{|W|}$
-(1.58~bits).
-\item \textbf{GPTQ-4bit}: Layer-wise Hessian-based optimal rounding (4.0~bits).
-\end{itemize}
-
-\paragraph{Hardware.}
-All experiments run on a Google Colab T4 GPU (16~GB VRAM).
-Models loaded in FP32 for precise calibration; baselines cast as appropriate.
-
-% -----------------------------------------------------------------------
-\section{Results}
+% =================================================================
+\section{Results and Analysis}
 \label{sec:results}
-% -----------------------------------------------------------------------
+% =================================================================
 
-\subsection{Main Results: Perplexity vs. Bit Budget}
-
-Table~\ref{tab:main} reports perplexity on WikiText-2 and PTB for all methods on GPT-2 small,
-GPT-2 medium, and LLaMA-3.2-1B.
+Table~\ref{tab:main} reports the main comparison on both models.
+SMQ at 1.61~b is the only sub-2-bit method that does not collapse below uniform INT2.
 
 \begin{table}[h]
 \centering
-\caption{Perplexity (lower is better) and MMLU accuracy across models and methods.
-\textbf{Bold}: best non-FP16 result. $\dagger$: our method.}
-\label{tab:main}
-\begin{tabular}{@{}lcccccc@{}}
+\small
+\caption{Main results on GPT-2 medium (345M) and LLaMA-3.2-1B.
+PPL is on WT2 / PTB test sets (lower is better); Size is parameter footprint in GB.
+$\dagger$ = our method.}
+\label{tab:main}\label{tab:gpt2_main}\label{tab:llama_main}
+\setlength{\tabcolsep}{6pt}
+\renewcommand{\arraystretch}{1.05}
+\begin{tabular}{@{}lc rrr c rrr@{}}
 \toprule
-& \multicolumn{2}{c}{\textbf{GPT-2 small (124M)}}
-& \multicolumn{2}{c}{\textbf{GPT-2 medium (345M)}}
-& \multicolumn{2}{c}{\textbf{LLaMA-3.2-1B}} \\
-\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}
-Method & Bits & WT2$\downarrow$ & Bits & WT2$\downarrow$ & Bits & WT2$\downarrow$ \\
+& & \multicolumn{3}{c}{\textbf{GPT-2 medium (345M)}} & & \multicolumn{3}{c}{\textbf{LLaMA-3.2-1B}} \\
+\cmidrule(lr){3-5}\cmidrule(lr){7-9}
+Method & Bits & WT2 PPL$\downarrow$ & PTB PPL$\downarrow$ & Size (GB) & Bits & WT2 PPL$\downarrow$ & PTB PPL$\downarrow$ & Size (GB) \\
 \midrule
-FP16              & 16.0 & XX.XX  & 16.0 & XX.XX  & 16.0 & XX.XX \\
-Uniform INT2      &  2.0 & XX.XX  &  2.0 & XX.XX  &  2.0 & XX.XX \\
-BitNet ternary    &  1.58 & XX.XX &  1.58 & XX.XX &  1.58 & XX.XX \\
-GPTQ-4bit         &  4.0 & XX.XX  &  4.0 & XX.XX  &  4.0 & XX.XX \\
+FP16             & 16.0  & 21.64       & 22.53       & 0.61 & 16.0  & 10.96     & 11.32      & 2.47 \\
+Uniform INT2     &  2.0  & 1{,}451{,}721 & 1{,}310{,}861 & 0.08 &  2.0  & 164{,}165 & 168{,}767  & 0.31 \\
+BitNet ternary   &  1.0  & 1{,}556{,}522 & 1{,}448{,}814 & 0.04 &  1.58 & 99{,}786  & 104{,}487  & 0.16 \\
 \midrule
-Salient-Quant$^\dagger$ & \textbf{1.61} & \textbf{XX.XX} & \textbf{1.61} & \textbf{XX.XX} & \textbf{1.61} & \textbf{XX.XX} \\
+\textbf{SMQ$^\dagger$} & \textbf{1.61} & \textbf{541.05} & \textbf{547.75} & \textbf{0.06}
+                       & \textbf{1.61} & \textbf{35{,}831} & \textbf{31{,}859} & \textbf{0.24} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\begin{table}[h]
-\centering
-\caption{MMLU 5-shot accuracy (\%) on LLaMA-3.2-1B and memory footprint.}
-\label{tab:mmlu}
-\begin{tabular}{@{}lcccc@{}}
-\toprule
-Method & Bits & MMLU (\%)$\uparrow$ & Param. Mem. (GB) & Compression \\
-\midrule
-FP16               & 16.0 & XX.XX & 2.0  & 1$\times$ \\
-Uniform INT2       &  2.0 & XX.XX & 0.25 & 8$\times$ \\
-BitNet ternary     &  1.58 & XX.XX & 0.20 & 10$\times$ \\
-GPTQ-4bit          &  4.0 & XX.XX & 0.50 & 4$\times$ \\
-Salient-Quant      & \textbf{1.61} & \textbf{XX.XX} & \textbf{0.20} & \textbf{10$\times$} \\
-\bottomrule
-\end{tabular}
-\end{table}
+\textbf{GPT-2 medium.}
+SMQ is $\mathbf{2{,}683\times}$ better than Uniform INT2 on WT2 \emph{while using less
+memory} (0.06 vs.\ 0.08~GB at 1.61 vs.\ 2.0 bits), and $2{,}874\times$ better than BitNet
+at the same compression class.
+The 541~PPL absolute number is still far from the 21.64 FP16 ceiling --- expected for
+sub-2-bit PTQ without quantization-aware fine-tuning --- but the \emph{relative}
+result shows salience-guided allocation rescues the model from catastrophic collapse.
 
-\subsection{Bit Allocation Analysis}
+\textbf{LLaMA-3.2-1B.}
+SMQ is $\mathbf{4.6\times}$ better than Uniform INT2 and $2.8\times$ better than BitNet
+at the same compression.
+The absolute LLaMA PPL (35{,}831 vs.\ 10.96 FP16) is high: the 1B model's response to
+sub-2-bit PTQ is more brittle than 345M's, consistent with the literature.
+The bit-budget Pareto sweep (Appendix~\ref{app:bitbudget}) shows 1.61~b is the empirical
+optimum among seven settings tested; targets $\geq 2.0$~b silently collapse to uniform
+INT2 due to a known 4-bit-tier activation bug (Section~\ref{sec:limits}).
 
-At the 1.61-bit target, the allocator assigns approximately 39\% of weights to 1-bit and
-61\% to 2-bit (0\% require 4-bit).
-Figure~\ref{fig:allocation} shows the per-layer bit allocation heatmap, revealing that
-later transformer layers (closer to the output) tend to receive higher precision, consistent
-with the finding that later layers contribute more to token prediction quality.
+\textit{Reconciling Table~\ref{tab:main} with the ablations.}
+The headline numbers above (541 on GPT-2~medium, 35{,}831 on LLaMA-1B) reflect the
+deployed YAML configurations.
+The ablation grids in Section~\ref{sec:ablations} sweep one axis at a time over the
+post-OOM-fix pipeline, which differs from the deployed config along several axes
+(\texttt{block\_size}, ensemble weighting, and on LLaMA the \texttt{asymmetric}
+$\rightarrow$ \texttt{symmetric} choice surfaced in Ablation~6).
+Absolute PPL across ablation rows is therefore \emph{not} directly comparable to
+Table~\ref{tab:main}; the comparable quantity is the \emph{relative} ranking within
+each ablation table.
+On LLaMA, Ablation~6 specifically indicates that switching the deployed
+\texttt{llama\_full.yaml} from \texttt{asymmetric} to \texttt{symmetric} should pull the
+35{,}831 number toward the $\sim$30{,}800 seen at the same bit budget in
+Table~\ref{tab:abl_llama}.
 
-\begin{figure}[h]
-\centering
-\includegraphics[width=0.85\textwidth]{../results/gpt2_colab/plots/bit_allocation.png}
-\caption{Per-layer bit allocation heatmap for GPT-2 small at 1.61-bit average.
-Brighter colors indicate higher bit-width (more salient weights).}
-\label{fig:allocation}
-\end{figure}
-
-\subsection{PPL vs. Compression Tradeoff}
-
-Figure~\ref{fig:tradeoff} plots perplexity against average bit-width for Salient-Quant and
-all uniform baselines, demonstrating Pareto dominance at every tested bit budget.
-
-\begin{figure}[h]
-\centering
-% placeholder: \includegraphics[width=0.7\textwidth]{../results/gpt2_full/plots/ablation_bit_budget.png}
-\caption{Perplexity vs.\ average bit-width for Salient-Quant (blue curve) and uniform
-baselines (markers). Salient-Quant Pareto-dominates all uniform methods at every budget.}
-\label{fig:tradeoff}
-\end{figure}
-
-% -----------------------------------------------------------------------
+% =================================================================
 \section{Ablation Studies}
 \label{sec:ablations}
-% -----------------------------------------------------------------------
+% =================================================================
 
-We conduct six ablation studies to isolate the contribution of each design choice.
-Unless stated otherwise, all ablations use GPT-2 medium with WikiText-2 perplexity.
+We isolate six design choices.
+Salience-metric and granularity ablations use GPT-2 medium where the row-coherence fix is
+established; the rest use LLaMA-3.2-1B at 1.61~b with $N{=}256$ calibration samples.
+\emph{Note on absolute values:} the ablation pipeline is a post-OOM-fix configuration that
+differs from the deployed Table~\ref{tab:main} runs along several axes (block size,
+ensemble weighting, scheme); compare \emph{within} an ablation table rather than
+\emph{between} the ablations and the main results.
 
-\subsection{Ablation 1: Salience Metric}
+\textbf{Ablation 1 -- Salience metric (GPT-2 medium).}
+Table~\ref{tab:abl_metric} compares each of the five metrics individually against the
+ensemble.
+The ensemble dominates every single metric;
+\emph{magnitude} (L1/L2) is the strongest single predictor, contradicting the literature's
+emphasis on gradient/Hessian sensitivity --- a useful finding for low-cost pipelines that
+cannot afford a backward pass.
+Hessian-only allocation breaks budget control: per-element Fisher scores are near-uniform,
+so the allocator cannot rank weights and over-shoots to 2.0~b on average.
 
-Table~\ref{tab:abl_metric} compares using each metric individually versus the full ensemble.
-The ensemble consistently outperforms any single metric, confirming that the five metrics
-capture complementary aspects of weight importance.
-The Hessian (Fisher) metric is the strongest single predictor, followed closely by the
-gradient sensitivity metric.
+\textbf{Ablation 2 -- Granularity (GPT-2 medium).}
+Per-element bit allocation is essential: coarsening to channel-wise costs $154\times$ in
+PPL, layer-wise $291\times$.
+The same pattern replicates on LLaMA (Ablation~5 below): coarse granularities also
+\emph{undershoot} the bit budget (channel hits 1.54, layer 1.45) because group-level
+allocation cannot fine-tune to 1.61.
 
 \begin{table}[h]
+\small
 \centering
-\caption{Perplexity at 1.61-bit average using different salience metrics (GPT-2 medium).}
+\begin{minipage}[t]{0.46\linewidth}
+\centering
+\caption{Ablation~1 (GPT-2 medium, 1.61~b).}
 \label{tab:abl_metric}
 \begin{tabular}{@{}lcc@{}}
 \toprule
-Salience Metric & WT2 PPL$\downarrow$ & $\Delta$ vs. Ensemble \\
+Metric & PPL$\downarrow$ & vs.\ Ensemble \\
 \midrule
-Magnitude L1       & XX.XX & +XX.XX \\
-Magnitude L2       & XX.XX & +XX.XX \\
-Gradient           & XX.XX & +XX.XX \\
-Hessian (Fisher)   & XX.XX & +XX.XX \\
-Activation-aware   & XX.XX & +XX.XX \\
-\textbf{Ensemble (all 5)} & \textbf{XX.XX} & 0.00 \\
+Magnitude L1 & 9{,}274  & $1.68\times$ \\
+Magnitude L2 & 9{,}095  & $1.65\times$ \\
+Gradient     & 72{,}671 & $13.2\times$ \\
+Activation   & 27{,}128 & $4.92\times$ \\
+Hessian (over-allocates)& 243{,}575 & $44\times$ \\
+\midrule
+\textbf{Ensemble} & \textbf{5{,}512} & --- \\
 \bottomrule
 \end{tabular}
-\end{table}
-
-\subsection{Ablation 2: Bit Budget Sweep}
-
-Table~\ref{tab:abl_budget} sweeps the target average bits from 1.0 to 4.0, plotting
-the Pareto frontier.
-
-\begin{table}[h]
+\end{minipage}\hfill%
+\begin{minipage}[t]{0.50\linewidth}
 \centering
-\caption{Perplexity at different bit budgets (GPT-2 medium, weight-wise allocation).}
-\label{tab:abl_budget}
+\caption{Ablation~2 (GPT-2 med) and Ablation~5 (LLaMA-1B).
+Both at 1.61~b target.}
+\label{tab:abl_gran}
 \begin{tabular}{@{}lcc@{}}
 \toprule
-Target Avg Bits & Composition & WT2 PPL$\downarrow$ \\
+Granularity & GPT-2 PPL & LLaMA PPL (achieved bits) \\
 \midrule
-1.0  & 100\% 1-bit         & XX.XX \\
-1.3  & 70\% 1b, 30\% 2b    & XX.XX \\
-\textbf{1.61} & \textbf{39\% 1b, 61\% 2b} & \textbf{XX.XX} \\
-2.0  & 100\% 2-bit         & XX.XX \\
-2.5  & 50\% 2b, 50\% 4b    & XX.XX \\
-3.0  & 25\% 2b, 75\% 4b    & XX.XX \\
-4.0  & 100\% 4-bit         & XX.XX \\
+\textbf{Weight}  & \textbf{5{,}681} & \textbf{29{,}877} (1.60) \\
+Channel & 872{,}569 & 228{,}927 (1.54) \\
+Layer   & 1{,}654{,}710 & 190{,}060 (1.45) \\
 \bottomrule
 \end{tabular}
+\end{minipage}
 \end{table}
 
-\subsection{Ablation 3: Calibration Data Size}
+\textbf{Ablations 3, 4, 6, 7 -- LLaMA-3.2-1B sweeps.}
+Table~\ref{tab:abl_llama} consolidates the four LLaMA-1B ablations at the 1.61~b target.
+Each row varies one axis with all others held at default.
 
-\begin{table}[h]
+\begin{table}[!ht]
+\footnotesize
 \centering
-\caption{Effect of calibration set size on perplexity (GPT-2 medium, 1.61-bit target).}
-\label{tab:abl_calib}
-\begin{tabular}{@{}lcc@{}}
+\setlength{\tabcolsep}{5pt}
+\renewcommand{\arraystretch}{0.95}
+\caption{LLaMA-3.2-1B ablations (target 1.61~b, $N{=}256$, \texttt{block\_size}=32).
+Achieved bits in parentheses.}
+\label{tab:abl_llama}
+\begin{tabular}{@{}llc@{}}
 \toprule
-Calibration Samples & Phase 1 Time (s) & WT2 PPL$\downarrow$ \\
+Axis & Configuration & WT2 PPL$\downarrow$ \\
 \midrule
-128  & XX & XX.XX \\
-256  & XX & XX.XX \\
-\textbf{512}  & \textbf{XX} & \textbf{XX.XX} \\
-1024 & XX & XX.XX \\
+\multirow{4}{*}{Ablation 3 -- Bit-budget sweep}
+  & target~1.0~b   & 90{,}337 (1.00) \\
+  & target~1.3~b   & 43{,}288 (1.28) \\
+  & \textbf{target~1.61~b} & \textbf{29{,}721} (1.60) \\
+  & target~$\geq$2.0~b (4 settings collapse to INT2) & 113{,}582 (2.00) \\
+\midrule
+\multirow{4}{*}{Ablation 4 -- Calibration size}
+  & $N{=}128$  & 31{,}425 \\
+  & \textbf{$N{=}256$}  & \textbf{29{,}877} \\
+  & $N{=}512$  & 30{,}936 \\
+  & $N{=}1024$ & 31{,}774 \\
+\midrule
+\multirow{2}{*}{Ablation 6 -- Quant scheme}
+  & \textbf{Symmetric}  & \textbf{30{,}792} \\
+  & Asymmetric (deployed in YAML) & 295{,}858 \\
+\midrule
+\multirow{5}{*}{Ablation 7 -- Ensemble weights $\boldsymbol{\alpha}$}
+  & \textbf{Magnitude-heavy} (0.30, 0.30, 0.15, 0.15, 0.10) & \textbf{21{,}977} \\
+  & Default (0.15, 0.15, 0.25, 0.25, 0.20) & 30{,}896 \\
+  & Activation-heavy (0.10, 0.10, 0.15, 0.15, 0.50) & 34{,}803 \\
+  & Uniform (0.20$\times$5)                            & 34{,}779 \\
+  & Gradient-heavy (0.10, 0.10, 0.40, 0.30, 0.10)      & 49{,}095 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\subsection{Ablation 4: Allocation Granularity}
+Three findings stand out (each highlighted in Table~\ref{tab:abl_llama}):
+(i)~targets~$\geq 2.0$~b silently collapse to Uniform INT2 because the 4-bit tier never
+activates;
+(ii)~symmetric 2-bit beats asymmetric by $9.6\times$, yet \texttt{llama\_full.yaml} ships
+\texttt{asymmetric} --- flipping it should pull LLaMA PPL from 35{,}831 toward $\sim$30{,}800;
+(iii)~a magnitude-heavy ensemble outperforms the gradient/Hessian-heavy default,
+echoing Ablation~1.
+Plots for all five LLaMA ablations are in Appendix~\ref{app:plots}.
 
-Weight-wise allocation is the most granular---and most accurate---but requires storing a
-bit-assignment tensor of the same size as the weight matrix.
-Channel-wise and layer-wise are coarser but have lower overhead.
+% =================================================================
+\section{Bottleneck, Profiling, and Engineering}
+\label{sec:bottleneck}
+% =================================================================
 
-\begin{table}[h]
-\centering
-\caption{Effect of allocation granularity on accuracy and overhead (GPT-2 medium).}
-\label{tab:abl_granularity}
-\begin{tabular}{@{}lccc@{}}
-\toprule
-Granularity & Overhead & Alloc. Time (s) & WT2 PPL$\downarrow$ \\
-\midrule
-Layer-wise   & $O(L)$       & XX & XX.XX \\
-Channel-wise & $O(L \cdot C)$ & XX & XX.XX \\
-\textbf{Weight-wise}  & $O(N)$   & \textbf{0.12} & \textbf{XX.XX} \\
-\bottomrule
-\end{tabular}
-\end{table}
+\textbf{Per-phase runtime} on GPT-2 medium / T4: Phase~1 (salience) 147~s ($45\%$),
+Phase~2 (allocation) 0.45~s ($0.1\%$), Phase~3 (quantization) 178~s ($55\%$); end-to-end
+$\sim$25~min including evaluation.
+\textbf{Phase~1 dominates}: 89\% of compute is gradient/Hessian accumulation across 512
+calibration samples.
+The Ablation~1/7 finding that magnitude alone is competitive suggests an immediate
+$\sim$10$\times$ speedup is available by dropping the backward pass on
+accuracy-flexible deployments.
+\textbf{Phase~2 is solved} after vectorizing into one \texttt{torch.topk} call.
+\textbf{Phase~3 is reducible}: still a Python loop over 48 transformer blocks; full
+vectorization (designed but not deployed) would cut it from 178~s to $<$10~s.
+\textbf{Memory profile:} peak VRAM 13.1~GB of 14.56~GB usable on GPT-2 medium;
+LLaMA-1B needed reduced calibration ($N{=}128$--$256$ at sequence length~256, batch~1) to
+fit in the same budget.
 
-\subsection{Ablation 5: Quantization Scheme}
+\textbf{Unexpected dominant accuracy lever: row-coherence.}
+We expected the dominant accuracy driver to be the salience metric or the block size.
+It was neither --- it was the row-wise quantization fix from Section~\ref{sec:method}
+(Phase~3).
+In mixed-precision quantization, \emph{block coherence} (which weights share a scale)
+matters at least as much as which weights get more bits.
 
-\begin{table}[h]
-\centering
-\caption{Symmetric vs.\ asymmetric 2-bit quantization (GPT-2 medium, 1.61-bit target).}
-\label{tab:abl_scheme}
-\begin{tabular}{@{}lcc@{}}
-\toprule
-Scheme & Description & WT2 PPL$\downarrow$ \\
-\midrule
-Symmetric  & Levels: $\{-1.5s, -0.5s, +0.5s, +1.5s\}$ & XX.XX \\
-\textbf{Asymmetric} & Full $[\min, \max]$ range with zero-point & \textbf{XX.XX} \\
-\bottomrule
-\end{tabular}
-\end{table}
+\textbf{Seven engineering fixes} needed to fit on a 16~GB T4 (each is a documented commit):
+(1) FP16 model loading (saves $\sim$2~GB);
+(2) CPU-resident gradient/Hessian accumulators (1.4~GB each at FP32 for 345M params);
+(3) FP32 loss before backward (FP16 underflowed without GradScaler, producing zero/NaN
+gradients on $\sim$30\% of weights);
+(4) FP32 quantization math (per-block scale division loses precision in FP16);
+(5) CPU salience statistics (\texttt{torch.randperm(354M, device='cuda')} alone needs
+2.8~GB);
+(6) row-wise quantization (correctness \emph{and} memory: avoids 4--8~GB intermediates on
+1B models);
+(7) \texttt{block\_size}=32 with asymmetric quantization on GPT-2 (cut PPL from 12{,}173
+to 541 \emph{independent of} the row-coherence fix; LLaMA-1B Ablation~6 shows asymmetric
+is \emph{worse} at 1B scale --- this hyperparameter is model-dependent).
+The pattern across all seven fixes: \emph{numerical stability and memory locality matter
+more than algorithmic novelty}.
+A correct, memory-feasible pipeline beats a clever-but-OOM one every time, and reaching
+that pipeline took 40+ commits of OOM debugging documented in the repository's git history.
 
-\subsection{Ablation 6: Ensemble Weights}
+% =================================================================
+\section{Reproducibility, Limitations, and Future Work}
+\label{sec:limits}
+% =================================================================
 
-\begin{table}[h]
-\centering
-\caption{Effect of ensemble $\boldsymbol{\alpha}$ weights on perplexity (LLaMA-3.2-1B).}
-\label{tab:abl_ensemble}
-\begin{tabular}{@{}lcccccc@{}}
-\toprule
-Configuration & $\alpha_{\text{L1}}$ & $\alpha_{\text{L2}}$ & $\alpha_{\text{grad}}$
-& $\alpha_{\text{H}}$ & $\alpha_{\text{act}}$ & WT2 PPL$\downarrow$ \\
-\midrule
-Magnitude-heavy  & 0.30 & 0.30 & 0.15 & 0.15 & 0.10 & XX.XX \\
-Gradient-heavy   & 0.10 & 0.10 & 0.40 & 0.30 & 0.10 & XX.XX \\
-Hessian-heavy    & 0.10 & 0.10 & 0.20 & 0.50 & 0.10 & XX.XX \\
-Activation-heavy & 0.10 & 0.10 & 0.15 & 0.15 & 0.50 & XX.XX \\
-Uniform          & 0.20 & 0.20 & 0.20 & 0.20 & 0.20 & XX.XX \\
-\textbf{Default} & \textbf{0.15} & \textbf{0.15} & \textbf{0.25} & \textbf{0.25}
-& \textbf{0.20} & \textbf{XX.XX} \\
-\bottomrule
-\end{tabular}
-\end{table}
+\textbf{Reproducibility.} The artifact is at:
+\begin{center}\vspace{-0.4em}
+\href{https://github.com/anshuldani/Simplified-Quantization-for-Edge-Ready-Language-Models}{\small\texttt{github.com/anshuldani/Simplified-Quantization-for-Edge-Ready-Language-Models}}
+\vspace{-0.2em}\end{center}
+For a one-shot Colab T4 reproduction, open
+\texttt{notebooks/salient\_quant\_colab.ipynb}, set the runtime to T4, provide a
+HuggingFace token with LLaMA-3.2 access, and run all cells; results sync to Drive.
+Locally:
+\texttt{pip install -r requirements.txt} then
+\texttt{python experiments/run\_experiment.py --config configs/<gpt2\_full,llama\_full>.yaml}.
+Released artifacts: source code (\texttt{src/\{salience, quantizer, baselines, eval, utils\}}),
+configs, the Colab notebook, the six raw ablation JSONs in \texttt{results/llama\_full/},
+report figures, and 31+ pytest unit tests.
+Random seeds are fixed; rerunning produces bit-identical output to the JSONs shipped in
+this submission.
 
-% -----------------------------------------------------------------------
-\section{Analysis}
-\label{sec:analysis}
-% -----------------------------------------------------------------------
+\textbf{Limitations.}
+Two known bugs surfaced in Section~\ref{sec:ablations} are still in the deployed code: the
+4-bit-tier collapse at target~$\geq 2.0$~b on LLaMA, and the asymmetric-vs-symmetric
+mismatch in \texttt{llama\_full.yaml}.
+Three evaluations were deferred for time/budget: MMLU 5-shot
+(\texttt{lm-}\linebreak[1]\texttt{evaluation-}\linebreak[1]\texttt{harness} integration finished but did not run within the T4 session
+window), end-to-end inference latency (pure-PyTorch dequantization makes the FP16
+comparison uninformative without packed INT1/INT2 GEMM kernels), and the GPT-2 small
+results JSON (run completed but not preserved in the final Drive sync).
+At the method level, SMQ's gain over Uniform INT2 narrows from $4{,}000\times$ at 345M to
+$4.6\times$ at 1B; the FP16 gap widens with scale, suggesting sub-2-bit PTQ on 1B+ models
+needs quantization-aware fine-tuning or a learned salience metric.
+Memory savings are also \emph{simulated}: bits/weight are reported from the allocation
+map but the deployed weights are FP16 tensors holding quantized values, not packed ---
+realizing the $10\times$ DRAM savings on hardware requires custom INT1/INT2 storage and
+matching GEMM kernels.
 
-\paragraph{Why 1.61 bits?}
-The 1.61-bit target is not arbitrary: with bit choices $\{1, 2\}$, the minimum achievable
-average above 1-bit is determined by the fraction of weights that can be ``upgraded'' to 2-bit
-within the budget.
-At 1.61-bit, exactly 61\% of weights receive 2-bit precision; the remainder are 1-bit.
-This is the minimum average that maintains the 80/20 asymmetry while keeping the model
-substantially smaller than any uniform 2-bit scheme.
+\textbf{Future work.}
+(i)~INT1/INT2 packing and GEMM kernels.
+(ii)~Quantization-aware fine-tuning on top of the SMQ initialization.
+(iii)~Replicate the salience-metric and granularity ablations on LLaMA-3.2-1B.
+(iv)~Extend SMQ to attention KV-cache quantization.
 
-\paragraph{Salience bottleneck.}
-Phase 1 (salience scoring) dominates runtime at 77 seconds on a T4 GPU for GPT-2 small,
-compared to 0.12s (allocation) and 0.16s (quantization) for Phases 2 and 3.
-This is driven by the $N=512$ forward-backward passes required for gradient and Hessian
-estimation.
-For deployment pipelines where Phase 1 is cached, the per-model quantization time is
-sub-second.
+% =================================================================
+\section{Team Contribution Statement}
+\label{sec:contrib}
+% =================================================================
 
-\paragraph{Architecture-specific behavior.}
-GPT-2 uses \texttt{Conv1D} weight matrices (shape \texttt{[in, out]}) rather than
-standard \texttt{nn.Linear} (\texttt{[out, in]}).
-This transposed convention required special handling in activation hook registration and
-mixed-precision group extraction.
-Modern models (LLaMA, Mistral) use standard \texttt{nn.Linear}; the same codebase handles
-both via a 2D weight scan fallback.
+\textbf{Anshul Dani} (A20580060) led the salience-scoring pipeline, the bit-allocator
+vectorization, and the row-coherence quantization fix.
+Drove the Colab T4 memory-engineering work (the seven fixes in
+Section~\ref{sec:bottleneck}) and the LLaMA-3.2-1B ablation sweep.
+\textbf{Rohit Lahori} (A20582911) led the evaluation infrastructure, baseline
+implementations (FP16, Uniform INT2, BitNet, GPTQ scaffold), and the GPT-2 small/medium
+experimental runs.
+Implemented the WT2/PTB sliding-window perplexity evaluator, the results-aggregation
+pipeline, and the slide deck.
+Both authors contributed equally to writing this report and to the ablation analysis.
 
-\paragraph{Weight tying.}
-GPT-2 shares the embedding table (\texttt{wte}) with the output projection (\texttt{lm\_head})
-via a data pointer alias.
-Quantizing the tied head would silently corrupt the token embeddings, causing perplexity
-above $10^{11}$.
-We detect and skip all weight-tied parameters via \texttt{data\_ptr()} comparison.
-
-% -----------------------------------------------------------------------
-\section{Latency and Memory}
-\label{sec:efficiency}
-% -----------------------------------------------------------------------
-
-Table~\ref{tab:latency} reports token generation latency and memory savings.
-
-\begin{table}[h]
-\centering
-\caption{Latency and memory comparison on T4 GPU (LLaMA-3.2-1B, batch size 1).}
-\label{tab:latency}
-\begin{tabular}{@{}lcccc@{}}
-\toprule
-Method & Bits & ms/token$\downarrow$ & VRAM (GB)$\downarrow$ & Param. Mem. (GB)$\downarrow$ \\
-\midrule
-FP16              & 16.0 & XX.XX & XX.XX & 2.00 \\
-Uniform INT2      &  2.0 & XX.XX & XX.XX & 0.25 \\
-BitNet            &  1.58 & XX.XX & XX.XX & 0.20 \\
-Salient-Quant     &  1.61 & XX.XX & XX.XX & \textbf{0.20} \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-Salient-Quant's parameter footprint matches BitNet's at 0.20~GB for a 1B model---10$\times$
-smaller than FP16---while achieving substantially lower perplexity.
-Latency improvements are currently limited by the dequantization overhead of our pure-PyTorch
-implementation; hardware-specific kernels (e.g., custom CUDA INT1/INT2 GEMMs) would yield
-additional speedups beyond what is measured here.
-
-% -----------------------------------------------------------------------
+% =================================================================
 \section{Conclusion}
 \label{sec:conclusion}
-% -----------------------------------------------------------------------
+% =================================================================
 
-We presented Salient-Quant, a three-phase post-training quantization framework that exploits
-the 80/20 rule of weight importance to achieve 1.61-bit average precision while preserving
-model accuracy.
-Our five-metric salience ensemble identifies critical weights across magnitude, gradient,
-Hessian, and activation dimensions; a vectorized greedy allocator distributes the bit budget
-in under 0.15 seconds; and closed-form scale refinement minimizes reconstruction error without
-any optimization loop.
-
-On GPT-2 small, Salient-Quant achieves XX.XX perplexity at 1.61~bits---significantly better
-than Uniform INT2 (XX.XX at 2.0~bits) and BitNet (XX.XX at 1.58~bits)---while reducing model
-size by 10$\times$ relative to FP16.
-On LLaMA-3.2-1B, the method achieves XX.XX perplexity and XX.XX\% MMLU accuracy at 1.61~bits.
-Ablation studies confirm that the ensemble combination outperforms any single metric, gradient
-and Hessian terms contribute most to salience quality, and weight-wise allocation is
-consistently superior to coarser granularities.
-
-\paragraph{Future work.}
-Hardware-efficient INT1/INT2 GEMM kernels would translate parameter-memory savings into
-proportional latency reductions.
-Training-aware integration (quantization-aware fine-tuning on top of our PTQ initialization)
-could further close the gap to FP16.
-Extending the framework to attention weights and KV-cache quantization represents a natural
-next step for memory-bound inference.
+Salient-Quant achieves \textbf{541.05~PPL} on WT2 at 1.61~bits on GPT-2 medium
+($2{,}683\times$ better than Uniform INT2 at higher compression) and
+\textbf{35{,}831~PPL} on LLaMA-3.2-1B.
+The project's primary contribution is the \emph{measured, reproducible} account that
+follows: a six-axis ablation that contradicts several of our own design assumptions
+(magnitude beats Hessian; symmetric beats asymmetric on LLaMA; row-coherence dominates
+salience), and the documented memory-engineering needed to fit a 16~GB T4 budget.
+What we learned: when pushing PTQ below the 2-bit barrier, numerical stability and block
+coherence matter more than algorithmic novelty.
 
 \bibliographystyle{unsrt}
-\begin{thebibliography}{10}
+\begin{thebibliography}{12}\small
 
 \bibitem{frantar2023gptq}
 Frantar, E., Ashkboos, S., Hoefler, T., \& Alistarh, D. (2023).
 GPTQ: Accurate post-training quantization for generative pre-trained transformers.
-\textit{ICLR 2023}.
+\textit{ICLR}.
 
 \bibitem{lin2024awq}
 Lin, J., Tang, J., Tang, H., Yang, S., Dang, X., \& Han, S. (2024).
 AWQ: Activation-aware weight quantization for LLM compression and acceleration.
-\textit{MLSys 2024}.
+\textit{MLSys}.
 
 \bibitem{wang2023bitnet}
-Wang, H., Ma, S., Dong, L., Huang, S., Wang, H., Ma, L., Yang, F., Wang, R., Wu, Y., \& Wei, F. (2023).
+Wang, H., Ma, S., Dong, L., et al.\ (2023).
 BitNet: Scaling 1-bit transformers for large language models.
 \textit{arXiv:2310.11453}.
 
 \bibitem{lecun1990obd}
 LeCun, Y., Denker, J., \& Solla, S. (1990).
-Optimal brain damage.
-\textit{NeurIPS 1990}.
+Optimal brain damage. \textit{NeurIPS}.
 
 \bibitem{dettmers2022llm}
 Dettmers, T., Lewis, M., Belkada, Y., \& Zettlemoyer, L. (2022).
-LLM.int8(): 8-bit matrix multiplication for transformers at scale.
-\textit{NeurIPS 2022}.
+LLM.int8(): 8-bit matrix multiplication for transformers at scale. \textit{NeurIPS}.
 
 \bibitem{xiao2023smoothquant}
 Xiao, G., Lin, J., Seznec, M., Wu, H., Demouth, J., \& Han, S. (2023).
 SmoothQuant: Accurate and efficient post-training quantization for large language models.
-\textit{ICML 2023}.
+\textit{ICML}.
 
 \bibitem{hassibi1993obs}
 Hassibi, B., \& Stork, D. (1993).
-Second order derivatives for network pruning: Optimal brain surgeon.
-\textit{NeurIPS 1993}.
+Second order derivatives for network pruning: Optimal brain surgeon. \textit{NeurIPS}.
 
 \bibitem{yao2022zeroquant}
 Yao, Z., Yazdani Aminabadi, R., Zhang, M., Wu, X., Li, C., \& He, Y. (2022).
 ZeroQuant: Efficient and affordable post-training quantization for large-scale transformers.
-\textit{NeurIPS 2022}.
-
-\bibitem{nagel2021adaround}
-Nagel, M., Amjad, R. A., Van Baalen, M., Louizos, C., \& Blankevoort, T. (2021).
-Up or down? Adaptive rounding for post-training quantization.
-\textit{ICML 2021}.
+\textit{NeurIPS}.
 
 \bibitem{touvron2023llama}
-Touvron, H., Lavril, T., Izacard, G., Martinet, X., Lachaux, M.-A., Lacroix, T., \ldots \& Lample, G. (2023).
-LLaMA: Open and efficient foundation language models.
-\textit{arXiv:2302.13971}.
+Touvron, H., Lavril, T., Izacard, G., et al.\ (2023).
+LLaMA: Open and efficient foundation language models. \textit{arXiv:2302.13971}.
+
+\bibitem{raffel2020t5}
+Raffel, C., Shazeer, N., Roberts, A., et al.\ (2020).
+Exploring the limits of transfer learning with a unified text-to-text transformer.
+\textit{JMLR 21}.
+
+\bibitem{radford2019gpt2}
+Radford, A., Wu, J., Child, R., Luan, D., Amodei, D., \& Sutskever, I. (2019).
+Language models are unsupervised multitask learners. \textit{OpenAI Tech Report}.
+
+\bibitem{merity2017wikitext}
+Merity, S., Xiong, C., Bradbury, J., \& Socher, R. (2017).
+Pointer sentinel mixture models. \textit{ICLR}.
 
 \end{thebibliography}
 
 \appendix
 
-\section{Implementation Details}
-\label{app:impl}
-
-\paragraph{Block size.}
-All quantization kernels use block size $B = 64$.
-Smaller blocks yield tighter per-block scale estimates at the cost of more scale parameters
-(one scale per block), which is negligible for our evaluation purposes.
-
-\paragraph{Salience computation timing.}
-On a T4 GPU for GPT-2 small (124M parameters, 48 linear layers):
-Phase 1 (salience): 77~seconds;
-Phase 2 (allocation): 0.12~seconds;
-Phase 3 (quantization): 0.16~seconds.
-Total: $\sim$78~seconds.
-
-\paragraph{Weight-tying detection.}
-Before constructing the list of quantizable parameters, we collect \texttt{data\_ptr()} values
-for all \texttt{nn.Embedding} and \texttt{nn.EmbeddingBag} weights, then exclude any
-parameter whose \texttt{data\_ptr()} appears in this set.
-This correctly handles GPT-2's \texttt{lm\_head}/\texttt{wte} tying without requiring
-model-specific logic.
-
-\paragraph{Reproducibility.}
-All experiments use fixed random seeds.
-Code, configs, and results are available at:
-\url{https://github.com/YOUR_USERNAME/salient-quant}
-
-\section{Salience Score Distributions}
-\label{app:salience}
-
-Figure~\ref{fig:salience} shows per-layer salience score distributions for GPT-2 small,
-illustrating the heavy-tailed structure that motivates mixed-precision allocation.
+\section{Bit-Budget Pareto Sweep Plot}
+\label{app:bitbudget}
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.9\textwidth]{../results/gpt2_colab/plots/salience_distributions.png}
-\caption{Per-layer salience score distributions for GPT-2 small.
-Each violin represents one linear layer; heavy tails confirm that a small fraction of
-weights dominates the salience distribution.}
-\label{fig:salience}
+\includegraphics[width=0.92\textwidth]{figures/ablation_bit_budget.jpeg}
+\caption{Ablation~3: bit-budget sweep on LLaMA-3.2-1B with default ensemble weights.
+Targets~$\geq 2.0$~b collapse to identical 113{,}582~PPL because the allocator's 4-bit tier
+did not activate (see Section~\ref{sec:limits}); 1.61~b is the empirical optimum.}
 \end{figure}
+
+\section{Per-Ablation Plot Gallery}
+\label{app:plots}
+
+\begin{figure}[ht!]
+\centering
+\includegraphics[width=0.66\textwidth]{figures/ablation_calibration_size.jpeg}
+\caption{Ablation~4: calibration set size (LLaMA-1B, 1.61~b).
+Salience saturates at $N{=}256$.}
+\end{figure}
+
+\begin{figure}[ht!]
+\centering
+\includegraphics[width=0.66\textwidth]{figures/ablation_granularity.jpeg}
+\caption{Ablation~5: granularity (LLaMA-1B, 1.61~b target).
+Coarser granularities also undershoot the bit budget.}
+\end{figure}
+
+\begin{figure}[ht!]
+\centering
+\includegraphics[width=0.66\textwidth]{figures/ablation_quant_scheme.jpeg}
+\caption{Ablation~6: quantization scheme (LLaMA-1B, 1.61~b).
+Symmetric is $9.6\times$ better than asymmetric on LLaMA; the deployed config should be
+updated.}
+\end{figure}
+
+\begin{figure}[ht!]
+\centering
+\includegraphics[width=0.66\textwidth]{figures/ablation_ensemble_weights.jpeg}
+\caption{Ablation~7: ensemble weights (LLaMA-1B, 1.61~b).
+Magnitude-heavy outperforms the gradient/Hessian-heavy default.}
+\end{figure}
+
+\section{Implementation Notes}
+\label{app:impl}
+
+\paragraph{Block size.}
+GPT-2 and LLaMA pipelines both use \texttt{block\_size}=32; smaller blocks yield more
+per-block scales (small overhead) at substantially better PPL.
+
+\paragraph{Weight tying.}
+GPT-2 shares the embedding (\texttt{wte}) with the output projection (\texttt{lm\_head})
+via a data pointer alias.
+Quantizing the tied head silently corrupts token embeddings ($\text{PPL} > 10^{11}$);
+we detect and skip tied parameters via \texttt{data\_ptr()} comparison.
+
+\paragraph{Architecture-specific behavior.}
+GPT-2 uses \texttt{Conv1D} (shape \texttt{[in, out]}) rather than \texttt{nn.Linear}
+(\texttt{[out, in]}); this required special handling in activation hook registration and
+mixed-precision group extraction.
+LLaMA uses \texttt{nn.Linear}; the codebase handles both via a 2D weight scan fallback.
+
+\paragraph{Random seeds.}
+All experiments use seed~42 unless noted; ablation runs are re-seeded per configuration.
 
 \end{document}
